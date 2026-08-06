@@ -121,13 +121,18 @@ async def login_crous(page, email: str, password: str) -> None:
     altcha_label = page.locator(".altcha-label, label[for*='altcha']").first
     altcha_checkbox = page.locator(".altcha-checkbox input, input[id*='login[altcha]']").first
     if await altcha_label.count() > 0:
-        logger.info("Handling Altcha widget (label click)...")
+        logger.info("Handling Altcha widget (label click & wait for verification)...")
         await altcha_label.click(force=True)
-        await page.wait_for_timeout(1500)
+        try:
+            await page.wait_for_selector(".altcha[data-state='verified'], altcha-widget[aria-checked='true']", timeout=10000)
+            logger.info("Altcha widget verified successfully.")
+        except Exception:
+            logger.warning("Altcha verification selector wait timed out, continuing after buffer...")
+            await page.wait_for_timeout(3000)
     elif await altcha_checkbox.count() > 0:
         logger.info("Handling Altcha widget (checkbox click)...")
         await altcha_checkbox.click(force=True)
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(3000)
 
     # Submit form
     submit_btn = page.locator("button[type='submit'], input[type='submit']").first
@@ -139,11 +144,14 @@ async def login_crous(page, email: str, password: str) -> None:
     logger.info(f"Page URL after login submission: {current_url}")
 
     if "auth/sql/login" in current_url or "dispatcher/login" in current_url:
-        error_msg_el = page.locator(".alert, #pvelogininfo, .form-error")
+        error_elements = page.locator(".alert-danger, .alert, .form-error-message, .invalid-feedback, #boxlogin .alert")
         error_txt = ""
-        if await error_msg_el.count() > 0:
-            error_txt = (await error_msg_el.first.text_content()).strip()
-        raise RuntimeError(f"CROUS Login failed. URL remained on login page. {error_txt}")
+        if await error_elements.count() > 0:
+            texts = await error_elements.all_text_contents()
+            error_txt = " | ".join([t.strip() for t in texts if t.strip() and "Parcoursup" not in t])
+        if not error_txt:
+            error_txt = "Invalid credentials or rejected form submission (e.g. wrong email/password)."
+        raise RuntimeError(f"CROUS Login failed (URL remained on login page): {error_txt}")
 
     logger.info("Successfully authenticated fresh CROUS session.")
 
