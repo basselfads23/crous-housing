@@ -78,6 +78,7 @@ def send_ntfy_notification(topic: str, title: str, message: str, tags: str = "ho
     }
     if link:
         headers["Click"] = link
+        headers["Actions"] = f"view, Voir l'offre, {link}, clear=true"
 
     try:
         req = urllib.request.Request(url, data=message.encode("utf-8"), headers=headers, method="POST")
@@ -273,7 +274,7 @@ async def search_listings(page) -> list[dict]:
                 price = (await price_el.text_content()).strip() if await price_el.count() > 0 else "N/A"
 
                 desc_el = card.locator("p.fr-card__desc").first
-                address = (await desc_el.text_content()).strip() if await desc_el.count() > 0 else ""
+                address = (await desc_el.text_content()).strip() if await desc_el.count() > 0 and (await desc_el.text_content()).strip() else "Adresse non spécifiée"
 
                 details = await card.locator("p.fr-card__detail").all_text_contents()
                 surface = next((d.strip() for d in details if "m²" in d), "N/A")
@@ -299,10 +300,16 @@ async def search_listings(page) -> list[dict]:
     for item in intercepted_api_items:
         item_id = str(item.get("id", ""))
         title = item.get("title") or item.get("residenceName") or "CROUS Colocation"
-        address = item.get("address") or item.get("city") or ""
+        
+        street = item.get("address") or item.get("street") or ""
+        city = item.get("city") or ""
+        zip_code = item.get("zipCode") or ""
+        addr_parts = [p.strip() for p in [street, zip_code, city] if p and p.strip()]
+        address = ", ".join(addr_parts) if addr_parts else "Adresse non spécifiée"
+
         check_str = f"{address} {title}".lower()
 
-        if "marseille" in check_str or any(zip_code in check_str for zip_code in ["1300", "1301", "13001", "13002", "13003", "13004", "13005", "13006", "13007", "13008", "13009", "13010", "13011", "13012", "13013", "13014", "13015", "13016"]):
+        if "marseille" in check_str or any(z in check_str for z in ["1300", "1301", "13001", "13002", "13003", "13004", "13005", "13006", "13007", "13008", "13009", "13010", "13011", "13012", "13013", "13014", "13015", "13016"]):
             if item_id and item_id not in seen_ids:
                 seen_ids.add(item_id)
                 price_val = item.get("rent", {}).get("amount") or item.get("price")
