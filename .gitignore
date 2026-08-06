@@ -1,6 +1,7 @@
 # Environment and logs
 .env
 *.log
+!run_history.log
 __pycache__/
 *.pyc
 
