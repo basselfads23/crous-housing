@@ -363,6 +363,31 @@ async def run_watcher():
             # 1. Fresh Authentication
             await login_crous(page, crous_email, crous_password)
 
+            # Check if test mode requested via workflow_dispatch input or env var
+            if os.getenv("TEST_NOTIFICATION", "").lower() in ("true", "1", "yes"):
+                logger.info("TEST_NOTIFICATION requested. Sending test alert with real CROUS listing...")
+                test_title = "🏠 CROUS Test Alert: Cité Guérin"
+                test_body = (
+                    "Logement: Cité Guérin (Test)\n"
+                    "Prix: 266.62 €\n"
+                    "Surface: 12 m²\n"
+                    "Adresse: 39A rue Camille Guérin 87038 LIMOGES CEDEX\n"
+                    "Lien: https://trouverunlogement.lescrous.fr/tools/42/accommodations/285"
+                )
+                test_link = "https://trouverunlogement.lescrous.fr/tools/42/accommodations/285"
+                send_ntfy_notification(
+                    topic=ntfy_topic,
+                    title=test_title,
+                    message=test_body,
+                    tags="house,euro",
+                    link=test_link
+                )
+                await browser.close()
+                state["consecutive_failures"] = 0
+                save_state(state)
+                logger.info("Test notification sent successfully. Exiting test run.")
+                return
+
             # 2. Search listings
             current_listings = await search_listings(page)
 
