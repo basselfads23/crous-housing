@@ -19,6 +19,7 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 # Setup logging to file and stderr
 LOG_FILE = Path("watcher.log")
 STATE_FILE = Path("listings_seen.json")
+HISTORY_LOG_FILE = Path("run_history.log")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +30,28 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("crous_watcher")
+
+
+def append_run_history_log(status: str, summary: str) -> None:
+    """Append a timestamped run entry to run_history.log (capped at last 500 entries)."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    line = f"{timestamp} | [{status}] {summary}\n"
+
+    existing_lines = []
+    if HISTORY_LOG_FILE.exists():
+        try:
+            with open(HISTORY_LOG_FILE, "r", encoding="utf-8") as f:
+                existing_lines = f.readlines()
+        except Exception:
+            pass
+
+    updated_lines = (existing_lines + [line])[-500:]
+
+    try:
+        with open(HISTORY_LOG_FILE, "w", encoding="utf-8") as f:
+            f.writelines(updated_lines)
+    except Exception as err:
+        logger.error(f"Failed to write to {HISTORY_LOG_FILE}: {err}")
 
 
 def load_state() -> dict:
@@ -385,6 +408,7 @@ async def run_watcher():
                 await browser.close()
                 state["consecutive_failures"] = 0
                 save_state(state)
+                append_run_history_log("TEST", "Sent test notification with live listing Cité Guérin.")
                 logger.info("Test notification sent successfully. Exiting test run.")
                 return
 
@@ -422,6 +446,9 @@ async def run_watcher():
         state["consecutive_failures"] = 0
         save_state(state)
 
+        summary = f"Check completed. Listings found: {len(current_listings)} | New: {len(new_listings)} | Total seen: {len(state['seen_ids'])}"
+        append_run_history_log("SUCCESS", summary)
+
         if not new_listings:
             logger.info("No new listings found. Exiting quietly.")
 
@@ -429,6 +456,8 @@ async def run_watcher():
         logger.exception("An error occurred during watcher execution")
         state["consecutive_failures"] += 1
         save_state(state)
+
+        append_run_history_log("FAILURE", f"{str(err)} | Consecutive failures: {state['consecutive_failures']}")
 
         if state["consecutive_failures"] >= 3:
             send_ntfy_notification(

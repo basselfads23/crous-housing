@@ -42,10 +42,10 @@ jobs:
           TEST_NOTIFICATION: ${{ inputs.test_notification }}
         run: python crous_watcher.py
 
-      - name: Commit updated state file
+      - name: Commit updated state and run history log
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add listings_seen.json
-          git diff --staged --quiet || (git commit -m "chore: update listings_seen.json state [skip ci]" && git push)
+          git add listings_seen.json run_history.log
+          git diff --staged --quiet || (git commit -m "chore: update listings_seen.json and run_history.log [skip ci]" && git push)
