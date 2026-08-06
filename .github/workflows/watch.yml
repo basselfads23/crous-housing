@@ -27,7 +27,7 @@ jobs:
       - name: Install dependencies & Playwright Chromium
         run: |
           python -m pip install --upgrade pip
-          pip install playwright python-dotenv
+          pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
       - name: Run CROUS Watcher
