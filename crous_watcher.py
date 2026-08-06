@@ -118,23 +118,45 @@ async def login_crous(page, email: str, password: str) -> None:
     await password_input.fill(password)
 
     # Check for Altcha captcha checkbox if present
-    altcha_label = page.locator(".altcha-label, label[for*='altcha']").first
+    altcha_widget = page.locator("altcha-widget").first
+    altcha_label = page.locator("altcha-label, .altcha-label, label[for*='altcha']").first
     altcha_checkbox = page.locator(".altcha-checkbox input, input[id*='login[altcha]']").first
-    if await altcha_label.count() > 0:
-        logger.info("Handling Altcha widget (label click & wait for verification)...")
-        await altcha_label.click(force=True)
+
+    if await altcha_widget.count() > 0 or await altcha_label.count() > 0 or await altcha_checkbox.count() > 0:
+        logger.info("Handling Altcha widget...")
         try:
-            await page.wait_for_selector(".altcha[data-state='verified'], altcha-widget[aria-checked='true']", timeout=10000)
+            # 1. Try JS click on internal checkbox/label to ensure web component receives event
+            await page.evaluate("""() => {
+                const widget = document.querySelector('altcha-widget');
+                if (widget) {
+                    const cb = widget.querySelector('input[type="checkbox"]') || widget.shadowRoot?.querySelector('input[type="checkbox"]');
+                    if (cb) { cb.click(); return; }
+                    const lbl = widget.querySelector('label') || widget.shadowRoot?.querySelector('label');
+                    if (lbl) { lbl.click(); return; }
+                    widget.click();
+                }
+            }""")
+        except Exception as err:
+            logger.debug(f"JS Altcha click error: {err}")
+
+        # 2. Backup Playwright click if JS click didn't trigger
+        if await altcha_label.count() > 0:
+            try:
+                await altcha_label.click(timeout=3000)
+            except Exception:
+                pass
+
+        # Wait for Altcha PoW verification computation
+        logger.info("Waiting for Altcha PoW verification...")
+        try:
+            await page.wait_for_selector(".altcha[data-state='verified'], altcha-widget[aria-checked='true'], altcha-widget[data-state='verified']", timeout=12000)
             logger.info("Altcha widget verified successfully.")
         except Exception:
-            logger.warning("Altcha verification selector wait timed out, continuing after buffer...")
+            logger.warning("Altcha verification selector wait timed out, giving 3s buffer...")
             await page.wait_for_timeout(3000)
-    elif await altcha_checkbox.count() > 0:
-        logger.info("Handling Altcha widget (checkbox click)...")
-        await altcha_checkbox.click(force=True)
-        await page.wait_for_timeout(3000)
 
     # Submit form
+    logger.info("Submitting login form...")
     submit_btn = page.locator("button[type='submit'], input[type='submit']").first
     await submit_btn.click()
     await page.wait_for_load_state("networkidle")
@@ -144,13 +166,21 @@ async def login_crous(page, email: str, password: str) -> None:
     logger.info(f"Page URL after login submission: {current_url}")
 
     if "auth/sql/login" in current_url or "dispatcher/login" in current_url:
-        error_elements = page.locator(".alert-danger, .alert, .form-error-message, .invalid-feedback, #boxlogin .alert")
-        error_txt = ""
+        # Extract all visible error texts and form feedback
+        error_elements = page.locator(".alert-danger, .alert, .form-error-message, .invalid-feedback, #boxlogin .alert, .form-error")
+        texts = []
         if await error_elements.count() > 0:
-            texts = await error_elements.all_text_contents()
-            error_txt = " | ".join([t.strip() for t in texts if t.strip() and "Parcoursup" not in t])
+            for el in await error_elements.all():
+                txt = (await el.text_content()).strip()
+                if txt and "Parcoursup" not in txt and txt not in texts:
+                    texts.append(txt)
+
+        error_txt = " | ".join(texts)
         if not error_txt:
-            error_txt = "Invalid credentials or rejected form submission (e.g. wrong email/password)."
+            # Fallback: get text of boxlogin container to see what message is displayed
+            box_text = await page.locator("#boxlogin").text_content() if await page.locator("#boxlogin").count() > 0 else ""
+            error_txt = box_text.strip().replace("\n", " ")[:300] if box_text else "Invalid credentials or rejected form submission."
+
         raise RuntimeError(f"CROUS Login failed (URL remained on login page): {error_txt}")
 
     logger.info("Successfully authenticated fresh CROUS session.")
