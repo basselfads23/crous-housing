@@ -209,7 +209,6 @@ async def search_listings(page) -> list[dict]:
 
     page.on("response", handle_response)
 
-    # We check tools 42 (current year) and 47 (next year)
     tool_ids = ["42", "47"]
 
     for tool_id in tool_ids:
@@ -217,9 +216,12 @@ async def search_listings(page) -> list[dict]:
         logger.info(f"Navigating to search page: {search_url}")
 
         try:
+            # Clear any default initial page load items
+            intercepted_api_items.clear()
+
             await page.goto(search_url, wait_until="networkidle", timeout=20000)
 
-            # 1. Location input
+            # 1. Location input (Marseille)
             loc_input = page.locator("#PlaceAutocompletearia-autocomplete-1-input, #PlaceAutocomplete").first
             if await loc_input.count() > 0:
                 await loc_input.fill("Marseille")
@@ -242,15 +244,18 @@ async def search_listings(page) -> list[dict]:
                 if not await coloc_checkbox.is_checked():
                     await coloc_checkbox.check(force=True)
 
+            # Clear initial network items right before submitting search
+            intercepted_api_items.clear()
+
             # 4. Execute search
             if await price_input.count() > 0:
                 await price_input.press("Enter")
                 await page.wait_for_load_state("networkidle")
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(2500)
 
-            # Extract from DOM cards
+            # Extract from DOM cards (only if matching Marseille)
             cards = await page.locator(".fr-card").all()
-            logger.info(f"Tool {tool_id}: found {len(cards)} accommodation cards in DOM")
+            logger.info(f"Tool {tool_id}: found {len(cards)} accommodation cards in DOM after search")
 
             for card in cards:
                 title_el = card.locator("h3.fr-card__title a").first
@@ -261,7 +266,6 @@ async def search_listings(page) -> list[dict]:
                 href = await title_el.get_attribute("href") or ""
                 full_link = f"https://trouverunlogement.lescrous.fr{href}" if href.startswith("/") else href
 
-                # Extract ID from href (e.g. /tools/42/accommodations/285 -> 285)
                 parts = [p for p in href.split("/") if p]
                 listing_id = parts[-1] if parts else href
 
@@ -269,45 +273,51 @@ async def search_listings(page) -> list[dict]:
                 price = (await price_el.text_content()).strip() if await price_el.count() > 0 else "N/A"
 
                 desc_el = card.locator("p.fr-card__desc").first
-                address = (await desc_el.text_content()).strip() if await desc_el.count() > 0 else "Marseille"
+                address = (await desc_el.text_content()).strip() if await desc_el.count() > 0 else ""
 
                 details = await card.locator("p.fr-card__detail").all_text_contents()
                 surface = next((d.strip() for d in details if "m²" in d), "N/A")
 
-                if listing_id and listing_id not in seen_ids:
-                    seen_ids.add(listing_id)
-                    listings.append({
-                        "id": listing_id,
-                        "name": title,
-                        "address": address,
-                        "price": price,
-                        "surface": surface,
-                        "link": full_link
-                    })
+                # Verify listing is in Marseille
+                address_check = f"{address} {title}".lower()
+                if "marseille" in address_check or any(zip_code in address_check for zip_code in ["1300", "1301", "13001", "13002", "13003", "13004", "13005", "13006", "13007", "13008", "13009", "13010", "13011", "13012", "13013", "13014", "13015", "13016"]):
+                    if listing_id and listing_id not in seen_ids:
+                        seen_ids.add(listing_id)
+                        listings.append({
+                            "id": listing_id,
+                            "name": title,
+                            "address": address,
+                            "price": price,
+                            "surface": surface,
+                            "link": full_link
+                        })
 
         except Exception as err:
             logger.warning(f"Error during search on tool {tool_id}: {err}")
 
-    # Process any intercepted API items if DOM cards were empty or complementary
+    # Process API items matching Marseille
     for item in intercepted_api_items:
         item_id = str(item.get("id", ""))
-        if item_id and item_id not in seen_ids:
-            seen_ids.add(item_id)
-            title = item.get("title") or item.get("residenceName") or "CROUS Colocation"
-            address = item.get("address") or item.get("city") or "Marseille"
-            price_val = item.get("rent", {}).get("amount") or item.get("price")
-            price_str = f"{price_val / 100:.2f} €" if isinstance(price_val, (int, float)) and price_val > 1000 else f"{price_val} €"
-            surface_str = f"{item.get('area', {}).get('min', 'N/A')} m²"
-            link = f"https://trouverunlogement.lescrous.fr/tools/42/accommodations/{item_id}"
+        title = item.get("title") or item.get("residenceName") or "CROUS Colocation"
+        address = item.get("address") or item.get("city") or ""
+        check_str = f"{address} {title}".lower()
 
-            listings.append({
-                "id": item_id,
-                "name": title,
-                "address": address,
-                "price": price_str,
-                "surface": surface_str,
-                "link": link
-            })
+        if "marseille" in check_str or any(zip_code in check_str for zip_code in ["1300", "1301", "13001", "13002", "13003", "13004", "13005", "13006", "13007", "13008", "13009", "13010", "13011", "13012", "13013", "13014", "13015", "13016"]):
+            if item_id and item_id not in seen_ids:
+                seen_ids.add(item_id)
+                price_val = item.get("rent", {}).get("amount") or item.get("price")
+                price_str = f"{price_val / 100:.2f} €" if isinstance(price_val, (int, float)) and price_val > 1000 else f"{price_val} €"
+                surface_str = f"{item.get('area', {}).get('min', 'N/A')} m²"
+                link = f"https://trouverunlogement.lescrous.fr/tools/42/accommodations/{item_id}"
+
+                listings.append({
+                    "id": item_id,
+                    "name": title,
+                    "address": address,
+                    "price": price_str,
+                    "surface": surface_str,
+                    "link": link
+                })
 
     return listings
 
