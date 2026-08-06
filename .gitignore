@@ -1,0 +1,10 @@
+# Environment and logs
+.env
+*.log
+__pycache__/
+*.pyc
+
+# Local test artifacts
+*.html
+*.json
+!listings_seen.json
