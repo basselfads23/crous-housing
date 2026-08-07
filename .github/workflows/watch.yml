@@ -1,9 +1,6 @@
 name: CROUS Housing Watcher
 
 on:
-  schedule:
-    # Run every 15 minutes on off-peak minutes to avoid GitHub runner queue delays
-    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       test_notification:
