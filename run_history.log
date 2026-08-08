@@ -147,3 +147,7 @@
 2026-08-08 22:32:03 UTC | [SUCCESS] Check completed. Listings found: 0 | New: 0 | Total seen: 24
 2026-08-08 22:46:58 UTC | [SUCCESS] Check completed. Listings found: 0 | New: 0 | Total seen: 24
 2026-08-08 23:02:02 UTC | [SUCCESS] Check completed. Listings found: 0 | New: 0 | Total seen: 24
+2026-08-08 23:16:24 UTC | [FAILURE] Page.goto: Timeout 30000ms exceeded.
+Call log:
+  - navigating to "https://trouverunlogement.lescrous.fr/mse/discovery/connect", waiting until "networkidle"
+ | Consecutive failures: 1
