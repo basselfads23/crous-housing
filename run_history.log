@@ -161,3 +161,4 @@ Call log:
 Call log:
   - navigating to "https://trouverunlogement.lescrous.fr/mse/discovery/connect", waiting until "networkidle"
  | Consecutive failures: 1
+2026-08-09 01:16:48 UTC | [SUCCESS] Check completed. Listings found: 0 | New: 0 | Total seen: 24
