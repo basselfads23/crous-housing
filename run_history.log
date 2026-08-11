@@ -412,3 +412,7 @@ Call log:
 2026-08-11 15:32:20 UTC | [SUCCESS] Check completed. Listings found: 0 | New: 0 | Total seen: 24
 2026-08-11 15:46:53 UTC | [SUCCESS] Check completed. Listings found: 0 | New: 0 | Total seen: 24
 2026-08-11 16:02:02 UTC | [SUCCESS] Check completed. Listings found: 0 | New: 0 | Total seen: 24
+2026-08-11 16:16:26 UTC | [FAILURE] Page.goto: Timeout 30000ms exceeded.
+Call log:
+  - navigating to "https://trouverunlogement.lescrous.fr/mse/discovery/connect", waiting until "networkidle"
+ | Consecutive failures: 1
