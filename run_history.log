@@ -428,3 +428,4 @@ Call log:
   - navigating to "https://trouverunlogement.lescrous.fr/mse/discovery/connect", waiting until "networkidle"
  | Consecutive failures: 1
 2026-08-12 21:02:04 UTC | [SUCCESS] Check completed. Listings found: 0 | New: 0 | Total seen: 24
+2026-08-12 21:16:47 UTC | [SUCCESS] Check completed. Listings found: 0 | New: 0 | Total seen: 24
