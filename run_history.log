@@ -479,3 +479,7 @@ Call log:
   - navigating to "https://trouverunlogement.lescrous.fr/mse/discovery/connect", waiting until "networkidle"
  | Consecutive failures: 1
 2026-08-13 06:01:58 UTC | [SUCCESS] Check completed. Listings found: 0 | New: 0 | Total seen: 24
+2026-08-13 06:16:20 UTC | [FAILURE] Locator.wait_for: Timeout 15000ms exceeded.
+Call log:
+  - waiting for locator("#login_login, input[name='login[login]']").first to be visible
+ | Consecutive failures: 1
