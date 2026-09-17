@@ -1,478 +1,608 @@
 #!/usr/bin/env python3
 """
-CROUS Housing Portal Watcher (crous_watcher.py)
+CROUS Housing 24/7 Watcher Daemon
+=================================
+High-speed, low-resource daemon that monitors the CROUS housing portal
+for new accommodations in Marseille (<= 400€) and delivers instant
+notifications via a dedicated Telegram bot.
 
-Monitors https://trouverunlogement.lescrous.fr for new student colocation listings
-in Marseille priced <= 400€. Read-only monitoring with ntfy.sh notifications.
+Features:
+- Fast direct REST API queries (no headless browser overhead).
+- Automatic discovery of active CROUS tool IDs.
+- Two-way Telegram bot commands (/status, /check, /test).
+- Atomic state persistence (crash-safe JSON store).
+- Daily heartbeat and failure alerts.
 """
 
 import os
 import sys
+import time
 import json
+import random
+import signal
 import logging
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# Setup logging to file and stderr
-LOG_FILE = Path("watcher.log")
-STATE_FILE = Path("listings_seen.json")
-HISTORY_LOG_FILE = Path("run_history.log")
+# Paths
+BASE_DIR = Path(__file__).resolve().parent
+STATE_FILE = BASE_DIR / "listings_seen.json"
+HISTORY_LOG_FILE = BASE_DIR / "run_history.log"
+LOG_FILE = BASE_DIR / "watcher.log"
 
+# Fix Windows console UTF-8 output
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# Load .env file explicitly from BASE_DIR
+try:
+    from dotenv import load_dotenv
+    load_dotenv(BASE_DIR / ".env")
+except ImportError:
+    # Minimal fallback parser if python-dotenv is not installed
+    env_path = BASE_DIR / ".env"
+    if env_path.exists():
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+
+
+# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stderr)
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger("crous_watcher")
 
+# Configuration from environment
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "45"))
+TARGET_CITY = os.getenv("TARGET_CITY", "Marseille").strip().lower()
+MAX_PRICE = float(os.getenv("MAX_PRICE", "400"))
+COLOCATION_ONLY = os.getenv("COLOCATION_ONLY", "false").lower() in ("true", "1", "yes")
+ENABLE_DAILY_HEARTBEAT = os.getenv("ENABLE_DAILY_HEARTBEAT", "true").lower() in ("true", "1", "yes")
 
-def append_run_history_log(status: str, summary: str) -> None:
-    """Append a timestamped run entry to run_history.log (capped at last 500 entries)."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    line = f"{timestamp} | [{status}] {summary}\n"
+# Global runtime metrics
+METRICS = {
+    "start_time": datetime.now(timezone.utc),
+    "last_check_time": None,
+    "total_checks": 0,
+    "last_active_listings_count": 0,
+    "last_error": None,
+    "telegram_update_offset": 0,
+}
 
-    existing_lines = []
-    if HISTORY_LOG_FILE.exists():
-        try:
-            with open(HISTORY_LOG_FILE, "r", encoding="utf-8") as f:
-                existing_lines = f.readlines()
-        except Exception:
-            pass
+RUNNING = True
 
-    updated_lines = (existing_lines + [line])[-500:]
+
+def handle_shutdown(signum, frame):
+    global RUNNING
+    logger.info(f"Received termination signal ({signum}). Gracefully shutting down...")
+    RUNNING = False
+
+
+signal.signal(signal.SIGINT, handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
+
+
+# ==============================================================================
+# Telegram API Helpers
+# ==============================================================================
+
+def send_telegram_message(text: str, reply_markup: dict = None) -> bool:
+    """Send a message to the configured Telegram chat."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram bot token or chat ID is missing. Skipping notification.")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": False
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
 
     try:
-        with open(HISTORY_LOG_FILE, "w", encoding="utf-8") as f:
-            f.writelines(updated_lines)
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("ok", False)
     except Exception as err:
-        logger.error(f"Failed to write to {HISTORY_LOG_FILE}: {err}")
+        logger.error(f"Failed to send Telegram message: {err}")
+        return False
 
+
+def poll_telegram_updates(on_check_callback=None):
+    """Poll Telegram getUpdates to handle user commands like /status, /check, /test."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    offset = METRICS["telegram_update_offset"]
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=0"
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "crous-watcher"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if not data.get("ok"):
+                return
+
+            for update in data.get("result", []):
+                update_id = update["update_id"]
+                METRICS["telegram_update_offset"] = update_id + 1
+
+                msg = update.get("message", {})
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = (msg.get("text") or "").strip()
+
+                # Security: only respond to the authorized user
+                if chat_id != TELEGRAM_CHAT_ID:
+                    continue
+
+                handle_telegram_command(text, on_check_callback)
+    except Exception as err:
+        logger.debug(f"Error checking Telegram updates: {err}")
+
+
+def handle_telegram_command(cmd: str, on_check_callback=None):
+    """Execute interactive Telegram commands."""
+    cmd_lower = cmd.lower()
+    logger.info(f"Received Telegram command: {cmd}")
+
+    if cmd_lower in ("/start", "/help"):
+        help_text = (
+            "🤖 *CROUS Watcher Bot - Commandes Disponibles*\n\n"
+            "• `/status` : Voir l'état du watcher et les statistiques\n"
+            "• `/check` : Lancer une vérification immédiate maintenant\n"
+            "• `/test` : Envoyer une notification de test\n"
+            "• `/help` : Afficher ce message d'aide\n\n"
+            f"🎯 *Ville ciblée :* {TARGET_CITY.capitalize()}\n"
+            f"💶 *Prix max :* {MAX_PRICE:.2f} €\n"
+            f"⏱️ *Intervalle :* ~{CHECK_INTERVAL_SECONDS}s"
+        )
+        send_telegram_message(help_text)
+
+    elif cmd_lower == "/status":
+        uptime = datetime.now(timezone.utc) - METRICS["start_time"]
+        hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        uptime_str = f"{hours}h {minutes}m {seconds}s"
+
+        last_check = METRICS["last_check_time"].strftime("%H:%M:%S UTC") if METRICS["last_check_time"] else "En cours..."
+        state = load_state()
+
+        status_text = (
+            "🟢 *CROUS Watcher Actif (24/7)*\n\n"
+            f"⏱️ *Uptime :* {uptime_str}\n"
+            f"🔄 *Vérifications totales :* {METRICS['total_checks']}\n"
+            f"🕒 *Dernière vérification :* {last_check}\n"
+            f"🇫🇷 *Offres actives en France :* {METRICS['last_active_listings_count']}\n"
+            f"💾 *Offres déjà enregistrées :* {len(state.get('seen_ids', []))}\n"
+            f"⚠️ *Échecs consécutifs :* {state.get('consecutive_failures', 0)}\n\n"
+            f"🎯 *Cible :* {TARGET_CITY.capitalize()} (≤ {MAX_PRICE} €)"
+        )
+        send_telegram_message(status_text)
+
+    elif cmd_lower == "/check":
+        send_telegram_message("🔎 *Vérification manuelle en cours...*")
+        if on_check_callback:
+            count, new_found = on_check_callback()
+            send_telegram_message(
+                f"✅ *Vérification terminée*\n\n"
+                f"• Offres trouvées à Marseille : *{count}*\n"
+                f"• Nouvelles alertes envoyées : *{new_found}*"
+            )
+
+    elif cmd_lower == "/test":
+        send_test_notification()
+
+
+def send_test_notification():
+    """Send a realistic test listing notification."""
+    test_text = (
+        "🏠 *[TEST] Nouvelle offre CROUS Marseille !*\n\n"
+        "📍 *Résidence :* Résidence Luminy (Test)\n"
+        "🏷️ *Type :* T1 Studio (18 m²)\n"
+        "💶 *Loyer :* 280.50 € / mois\n"
+        "📬 *Adresse :* 171 Avenue de Luminy, 13009 Marseille\n\n"
+        "⚡ *Ceci est une notification de test.*"
+    )
+    markup = {
+        "inline_keyboard": [
+            [{"text": "🚀 Ouvrir le portail CROUS", "url": "https://trouverunlogement.lescrous.fr"}]
+        ]
+    }
+    success = send_telegram_message(test_text, markup)
+    if success:
+        logger.info("Test notification dispatched successfully.")
+
+
+# ==============================================================================
+# State Management (Crash-safe atomic writes)
+# ==============================================================================
 
 def load_state() -> dict:
-    """Load seen listing IDs and consecutive failure count from STATE_FILE."""
+    """Load seen listing IDs from disk."""
     if not STATE_FILE.exists():
         return {"seen_ids": [], "consecutive_failures": 0}
 
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-
-        if isinstance(data, list):
-            # Convert legacy array format to dict format
-            return {"seen_ids": data, "consecutive_failures": 0}
-        elif isinstance(data, dict):
-            return {
-                "seen_ids": data.get("seen_ids", []),
-                "consecutive_failures": data.get("consecutive_failures", 0)
-            }
+            if isinstance(data, list):
+                return {"seen_ids": data, "consecutive_failures": 0}
+            elif isinstance(data, dict):
+                return {
+                    "seen_ids": data.get("seen_ids", []),
+                    "consecutive_failures": data.get("consecutive_failures", 0)
+                }
     except Exception as err:
-        logger.warning(f"Failed to read state file {STATE_FILE}: {err}. Resetting state.")
+        logger.warning(f"Error reading {STATE_FILE}: {err}. Resetting state.")
 
     return {"seen_ids": [], "consecutive_failures": 0}
 
 
 def save_state(state: dict) -> None:
-    """Save state dict to STATE_FILE."""
+    """Save state atomically using a temporary file."""
+    temp_file = STATE_FILE.with_suffix(".tmp")
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
-        logger.info(f"State saved to {STATE_FILE}")
+        temp_file.replace(STATE_FILE)
     except Exception as err:
-        logger.error(f"Failed to write state file {STATE_FILE}: {err}")
+        logger.error(f"Failed to atomically save state to {STATE_FILE}: {err}")
 
 
-def send_ntfy_notification(topic: str, title: str, message: str, tags: str = "house,euro", link: str = None) -> bool:
-    """Send notification via ntfy.sh."""
-    if not topic:
-        logger.warning("NTFY_TOPIC is not set. Skipping notification.")
-        return False
+def append_run_history(status: str, summary: str) -> None:
+    """Append a concise entry to run_history.log (capped at last 500 lines)."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    line = f"{timestamp} | [{status}] {summary}\n"
 
-    url = f"https://ntfy.sh/{topic.strip()}"
-    headers = {
-        "Title": title.encode("utf-8").decode("latin-1", "ignore"),
-        "Tags": tags,
-        "Content-Type": "text/plain; charset=utf-8"
-    }
-    if link:
-        headers["Click"] = link
-        headers["Actions"] = f"view, Voir l'offre, {link}, clear=true"
-
-    try:
-        req = urllib.request.Request(url, data=message.encode("utf-8"), headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status == 200:
-                logger.info(f"Notification sent successfully to ntfy.sh/{topic}")
-                return True
-            else:
-                logger.error(f"ntfy.sh returned HTTP {resp.status}")
-    except Exception as err:
-        logger.error(f"Failed to send ntfy notification: {err}")
-
-    return False
-
-
-async def login_crous(page, email: str, password: str) -> None:
-    """Log into CROUS account using Playwright."""
-    logger.info("Navigating to CROUS login page...")
-    login_url = "https://trouverunlogement.lescrous.fr/mse/discovery/connect"
-    await page.goto(login_url, wait_until="networkidle")
-
-    # Check if we are on the MesServices dispatcher page with the MSE Connect button
-    mse_connect_btn = page.locator('label[for="login[app][0]"]')
-    if await mse_connect_btn.count() > 0:
-        logger.info("Clicking MSE Connect button on dispatcher page...")
-        await mse_connect_btn.click()
-        await page.wait_for_load_state("networkidle")
-
-    # Wait for login inputs
-    logger.info("Filling credentials...")
-    email_input = page.locator("#login_login, input[name='login[login]']").first
-    password_input = page.locator("#login_password, input[name='login[password]']").first
-
-    await email_input.wait_for(state="visible", timeout=15000)
-    await password_input.wait_for(state="visible", timeout=15000)
-
-    await email_input.fill(email)
-    await password_input.fill(password)
-
-    # Check for Altcha captcha checkbox if present
-    altcha_widget = page.locator("altcha-widget").first
-    altcha_label = page.locator("altcha-label, .altcha-label, label[for*='altcha']").first
-    altcha_checkbox = page.locator(".altcha-checkbox input, input[id*='login[altcha]']").first
-
-    if await altcha_widget.count() > 0 or await altcha_label.count() > 0 or await altcha_checkbox.count() > 0:
-        logger.info("Handling Altcha widget...")
+    lines = []
+    if HISTORY_LOG_FILE.exists():
         try:
-            # 1. Try JS click on internal checkbox/label to ensure web component receives event
-            await page.evaluate("""() => {
-                const widget = document.querySelector('altcha-widget');
-                if (widget) {
-                    const cb = widget.querySelector('input[type="checkbox"]') || widget.shadowRoot?.querySelector('input[type="checkbox"]');
-                    if (cb) { cb.click(); return; }
-                    const lbl = widget.querySelector('label') || widget.shadowRoot?.querySelector('label');
-                    if (lbl) { lbl.click(); return; }
-                    widget.click();
-                }
-            }""")
-        except Exception as err:
-            logger.debug(f"JS Altcha click error: {err}")
-
-        # 2. Backup Playwright click if JS click didn't trigger
-        if await altcha_label.count() > 0:
-            try:
-                await altcha_label.click(timeout=3000)
-            except Exception:
-                pass
-
-        # Wait for Altcha PoW verification computation
-        logger.info("Waiting for Altcha PoW verification...")
-        try:
-            await page.wait_for_selector(".altcha[data-state='verified'], altcha-widget[aria-checked='true'], altcha-widget[data-state='verified']", timeout=12000)
-            logger.info("Altcha widget verified successfully.")
+            with open(HISTORY_LOG_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
         except Exception:
-            logger.warning("Altcha verification selector wait timed out, giving 3s buffer...")
-            await page.wait_for_timeout(3000)
+            pass
 
-    # Submit form
-    logger.info("Submitting login form...")
-    submit_btn = page.locator("button[type='submit'], input[type='submit']").first
-    await submit_btn.click()
-    await page.wait_for_load_state("networkidle")
-
-    # Check for authentication errors
-    current_url = page.url
-    logger.info(f"Page URL after login submission: {current_url}")
-
-    if "auth/sql/login" in current_url or "dispatcher/login" in current_url:
-        # Extract all visible error texts and form feedback
-        error_elements = page.locator(".alert-danger, .alert, .form-error-message, .invalid-feedback, #boxlogin .alert, .form-error")
-        texts = []
-        if await error_elements.count() > 0:
-            for el in await error_elements.all():
-                txt = (await el.text_content()).strip()
-                if txt and "Parcoursup" not in txt and txt not in texts:
-                    texts.append(txt)
-
-        error_txt = " | ".join(texts)
-        if not error_txt:
-            # Fallback: get text of boxlogin container to see what message is displayed
-            box_text = await page.locator("#boxlogin").text_content() if await page.locator("#boxlogin").count() > 0 else ""
-            error_txt = box_text.strip().replace("\n", " ")[:300] if box_text else "Invalid credentials or rejected form submission."
-
-        raise RuntimeError(f"CROUS Login failed (URL remained on login page): {error_txt}")
-
-    logger.info("Successfully authenticated fresh CROUS session.")
+    lines = (lines + [line])[-500:]
+    try:
+        with open(HISTORY_LOG_FILE, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception as err:
+        logger.error(f"Failed to write history log: {err}")
 
 
-async def search_listings(page) -> list[dict]:
+# ==============================================================================
+# CROUS API Scraper Engine
+# ==============================================================================
+
+def discover_tool_ids() -> list[str]:
+    """Dynamically discover active tool IDs from the CROUS homepage."""
+    url = "https://trouverunlogement.lescrous.fr/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+            import re
+            found = set(re.findall(r"/tools/(\d+)", html))
+            if found:
+                return sorted(list(found))
+    except Exception as err:
+        logger.debug(f"Tool discovery fallback: {err}")
+
+    # Default fallback
+    return ["47"]
+
+
+def fetch_all_crous_listings(tool_id: str) -> list[dict]:
     """
-    Search housing portal for Marseille colocation listings under 400€.
-    Returns list of extracted listing dicts.
+    Fetch all active listings for the given tool_id via the internal search REST API.
+    Paginates automatically until all items are collected.
     """
-    listings = []
-    seen_ids = set()
-    intercepted_api_items = []
+    all_items = []
+    page = 1
+    total_expected = None
 
-    # Listen for API search responses
-    async def handle_response(response):
-        if "api/fr/search" in response.url and response.status == 200:
-            try:
-                data = await response.json()
-                items = data.get("results", {}).get("items", [])
-                if items:
-                    intercepted_api_items.extend(items)
-                    logger.info(f"Intercepted {len(items)} items from search API response")
-            except Exception as e:
-                logger.debug(f"Could not parse API search response: {e}")
+    url = f"https://trouverunlogement.lescrous.fr/api/fr/search/{tool_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Content-Type": "application/json",
+        "Referer": f"https://trouverunlogement.lescrous.fr/tools/{tool_id}/search"
+    }
 
-    page.on("response", handle_response)
+    while True:
+        body = {"page": page}
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers=headers
+        )
 
-    tool_ids = ["42", "47"]
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            results = data.get("results", {})
+            items = results.get("items", [])
+            total_obj = results.get("total", {})
+            total_val = total_obj.get("value") if isinstance(total_obj, dict) else total_obj
 
-    for tool_id in tool_ids:
-        search_url = f"https://trouverunlogement.lescrous.fr/tools/{tool_id}/search"
-        logger.info(f"Navigating to search page: {search_url}")
+            if total_expected is None and total_val is not None:
+                total_expected = total_val
 
+            if not items:
+                break
+
+            all_items.extend(items)
+
+            # If we've collected all items, exit pagination
+            if total_expected and len(all_items) >= total_expected:
+                break
+
+            # If less than 20 items returned, we are on the last page
+            if len(items) < 20:
+                break
+
+            page += 1
+            if page > 10:  # safety ceiling
+                break
+
+    return all_items
+
+
+def is_target_listing(item: dict) -> tuple[bool, dict]:
+    """
+    Filter item according to TARGET_CITY, MAX_PRICE, and COLOCATION_ONLY.
+    Returns (matches, parsed_info_dict).
+    """
+    item_id = str(item.get("id", ""))
+    residence = item.get("residence", {})
+    residence_name = residence.get("label") or "Résidence CROUS"
+    address = residence.get("address") or ""
+    entity = residence.get("entity", {}).get("name", "")
+    room_label = item.get("label") or "Chambre"
+
+    # Surface
+    area_obj = item.get("area", {})
+    surface = area_obj.get("min") or area_obj.get("max") or "N/A"
+
+    # Occupation modes and rent calculation
+    occupation_modes = item.get("occupationModes", [])
+    rents = []
+    is_colocation = False
+
+    for mode in occupation_modes:
+        m_type = mode.get("type", "").lower()
+        if "sharing" in m_type or "coloc" in m_type:
+            is_colocation = True
+        rent_info = mode.get("rent", {})
+        min_rent = rent_info.get("min") or rent_info.get("max")
+        if min_rent is not None:
+            # Rent in API is in cents (e.g. 28050 -> 280.50€)
+            if min_rent > 1000:
+                rents.append(min_rent / 100.0)
+            else:
+                rents.append(float(min_rent))
+
+    if not rents:
+        raw_price = item.get("price") or 0
+        rents.append(raw_price / 100.0 if raw_price > 1000 else float(raw_price))
+
+    lowest_rent = min(rents) if rents else 9999.0
+
+    # 1. Location match: Marseille city or postal codes 13001-13016 (or 'all' for nationwide)
+    if TARGET_CITY in ("all", "*", ""):
+        city_match = True
+    else:
+        addr_clean = address.lower()
+        marseille_postal_codes = [f"1300{i}" for i in range(1, 10)] + [f"1301{i}" for i in range(0, 7)] + ["13000"]
+        import re
+        city_match = (
+            bool(re.search(r'\b' + re.escape(TARGET_CITY) + r'\b', addr_clean)) or
+            any(pc in addr_clean for pc in marseille_postal_codes)
+        )
+
+    if not city_match:
+        return False, {}
+
+    # 2. Price filter
+    if lowest_rent > MAX_PRICE:
+        return False, {}
+
+    # 3. Colocation filter
+    if COLOCATION_ONLY and not is_colocation and "coloc" not in room_label.lower():
+        return False, {}
+
+    parsed = {
+        "id": item_id,
+        "residence_name": residence_name,
+        "label": room_label,
+        "surface": surface,
+        "price": f"{lowest_rent:.2f}",
+        "address": address or "Marseille",
+        "is_coloc": is_colocation
+    }
+    return True, parsed
+
+
+def check_and_notify() -> tuple[int, int]:
+    """
+    Core check cycle:
+    1. Fetches listings from active CROUS tool(s).
+    2. Identifies new matching listings in Marseille.
+    3. Sends Telegram notifications with direct action button.
+    4. Updates listings_seen.json.
+    Returns (total_matching_in_marseille, new_alerts_sent).
+    """
+    state = load_state()
+    seen_ids = set(str(i) for i in state.get("seen_ids", []))
+
+    tool_ids = discover_tool_ids()
+    all_raw_items = []
+
+    for tid in tool_ids:
         try:
-            # Clear any default initial page load items
-            intercepted_api_items.clear()
-
-            await page.goto(search_url, wait_until="networkidle", timeout=20000)
-
-            # 1. Location input (Marseille)
-            loc_input = page.locator("#PlaceAutocompletearia-autocomplete-1-input, #PlaceAutocomplete").first
-            if await loc_input.count() > 0:
-                await loc_input.fill("Marseille")
-                await page.wait_for_timeout(1000)
-
-                suggestions = page.locator(".PlaceAutocomplete__list li")
-                if await suggestions.count() > 0:
-                    logger.info("Selecting Marseille suggestion...")
-                    await suggestions.first.click()
-                    await page.wait_for_timeout(500)
-
-            # 2. Max Price (<= 400€)
-            price_input = page.locator("#SearchFormPrice").first
-            if await price_input.count() > 0:
-                await price_input.fill("400")
-
-            # 3. Colocation filter
-            coloc_checkbox = page.locator("#SearchOccupationMode--house_sharing").first
-            if await coloc_checkbox.count() > 0:
-                if not await coloc_checkbox.is_checked():
-                    await coloc_checkbox.check(force=True)
-
-            # Clear initial network items right before submitting search
-            intercepted_api_items.clear()
-
-            # 4. Execute search
-            if await price_input.count() > 0:
-                await price_input.press("Enter")
-                await page.wait_for_load_state("networkidle")
-                await page.wait_for_timeout(2500)
-
-            # Extract from DOM cards (only if matching Marseille)
-            cards = await page.locator(".fr-card").all()
-            logger.info(f"Tool {tool_id}: found {len(cards)} accommodation cards in DOM after search")
-
-            for card in cards:
-                title_el = card.locator("h3.fr-card__title a").first
-                if await title_el.count() == 0:
-                    continue
-
-                title = (await title_el.text_content()).strip()
-                href = await title_el.get_attribute("href") or ""
-                full_link = f"https://trouverunlogement.lescrous.fr{href}" if href.startswith("/") else href
-
-                parts = [p for p in href.split("/") if p]
-                listing_id = parts[-1] if parts else href
-
-                price_el = card.locator("p.fr-badge").first
-                price = (await price_el.text_content()).strip() if await price_el.count() > 0 else "N/A"
-
-                desc_el = card.locator("p.fr-card__desc").first
-                address = (await desc_el.text_content()).strip() if await desc_el.count() > 0 and (await desc_el.text_content()).strip() else "Adresse non spécifiée"
-
-                details = await card.locator("p.fr-card__detail").all_text_contents()
-                surface = next((d.strip() for d in details if "m²" in d), "N/A")
-
-                # Verify listing is in Marseille
-                address_check = f"{address} {title}".lower()
-                if "marseille" in address_check or any(zip_code in address_check for zip_code in ["1300", "1301", "13001", "13002", "13003", "13004", "13005", "13006", "13007", "13008", "13009", "13010", "13011", "13012", "13013", "13014", "13015", "13016"]):
-                    if listing_id and listing_id not in seen_ids:
-                        seen_ids.add(listing_id)
-                        listings.append({
-                            "id": listing_id,
-                            "name": title,
-                            "address": address,
-                            "price": price,
-                            "surface": surface,
-                            "link": full_link
-                        })
-
+            items = fetch_all_crous_listings(tid)
+            for it in items:
+                it["_tool_id"] = tid
+            all_raw_items.extend(items)
         except Exception as err:
-            logger.warning(f"Error during search on tool {tool_id}: {err}")
+            logger.warning(f"Error fetching tool {tid}: {err}")
 
-    # Process API items matching Marseille
-    for item in intercepted_api_items:
-        item_id = str(item.get("id", ""))
-        title = item.get("title") or item.get("residenceName") or "CROUS Colocation"
-        
-        street = item.get("address") or item.get("street") or ""
-        city = item.get("city") or ""
-        zip_code = item.get("zipCode") or ""
-        addr_parts = [p.strip() for p in [street, zip_code, city] if p and p.strip()]
-        address = ", ".join(addr_parts) if addr_parts else "Adresse non spécifiée"
+    METRICS["last_active_listings_count"] = len(all_raw_items)
+    METRICS["last_check_time"] = datetime.now(timezone.utc)
+    METRICS["total_checks"] += 1
 
-        check_str = f"{address} {title}".lower()
+    matching_listings = []
+    new_alerts_sent = 0
 
-        if "marseille" in check_str or any(z in check_str for z in ["1300", "1301", "13001", "13002", "13003", "13004", "13005", "13006", "13007", "13008", "13009", "13010", "13011", "13012", "13013", "13014", "13015", "13016"]):
-            if item_id and item_id not in seen_ids:
-                seen_ids.add(item_id)
-                price_val = item.get("rent", {}).get("amount") or item.get("price")
-                price_str = f"{price_val / 100:.2f} €" if isinstance(price_val, (int, float)) and price_val > 1000 else f"{price_val} €"
-                surface_str = f"{item.get('area', {}).get('min', 'N/A')} m²"
-                link = f"https://trouverunlogement.lescrous.fr/tools/42/accommodations/{item_id}"
+    for item in all_raw_items:
+        matches, info = is_target_listing(item)
+        if matches:
+            matching_listings.append(info)
+            item_id = info["id"]
+            tool_id = item.get("_tool_id", "47")
 
-                listings.append({
-                    "id": item_id,
-                    "name": title,
-                    "address": address,
-                    "price": price_str,
-                    "surface": surface_str,
-                    "link": link
-                })
+            if item_id not in seen_ids:
+                # NEW LISTING FOUND! Send Telegram Alert!
+                logger.info(f"✨ NEW LISTING: {info['residence_name']} ({info['price']}€)")
+                listing_url = f"https://trouverunlogement.lescrous.fr/tools/{tool_id}/accommodations/{item_id}"
 
-    return listings
+                coloc_tag = " [Colocation]" if info["is_coloc"] else ""
+                alert_text = (
+                    "🏠 *NOUVELLE OFFRE CROUS MARSEILLE !*\n\n"
+                    f"📍 *Résidence :* {info['residence_name']}\n"
+                    f"🏷️ *Type :* {info['label']}{coloc_tag} ({info['surface']} m²)\n"
+                    f"💶 *Loyer :* {info['price']} € / mois\n"
+                    f"📬 *Adresse :* {info['address']}\n\n"
+                    "⚡ *Fais vite, clique ci-dessous pour réserver immédiatement !*"
+                )
+                reply_markup = {
+                    "inline_keyboard": [
+                        [{"text": "🚀 Ouvrir l'offre & Réserver", "url": listing_url}]
+                    ]
+                }
+
+                if send_telegram_message(alert_text, reply_markup):
+                    seen_ids.add(item_id)
+                    new_alerts_sent += 1
+
+    # Update state
+    state["seen_ids"] = list(seen_ids)
+    state["consecutive_failures"] = 0
+    save_state(state)
+
+    summary = (
+        f"Check completed: {len(all_raw_items)} in France | "
+        f"{len(matching_listings)} in Marseille | "
+        f"{new_alerts_sent} new alerts sent"
+    )
+    logger.info(summary)
+    if new_alerts_sent > 0:
+        append_run_history("ALERT", summary)
+
+    return len(matching_listings), new_alerts_sent
 
 
-async def run_watcher():
-    """Main watcher routine."""
-    crous_email = os.getenv("CROUS_EMAIL")
-    crous_password = os.getenv("CROUS_PASSWORD")
-    ntfy_topic = os.getenv("NTFY_TOPIC")
+# ==============================================================================
+# Main Daemon Loop
+# ==============================================================================
+
+def main_loop():
+    logger.info("==================================================")
+    logger.info("🚀 CROUS Watcher Daemon starting (24/7 Mode)")
+    logger.info(f"Target City: {TARGET_CITY.capitalize()} | Max Price: {MAX_PRICE}€")
+    logger.info(f"Polling Cadence: ~{CHECK_INTERVAL_SECONDS}s (with random jitter)")
+    logger.info(f"Telegram Notifications: {'Enabled' if TELEGRAM_BOT_TOKEN else 'Disabled'}")
+    logger.info("==================================================")
+
+    # Validate configuration
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("FATAL: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing from .env!")
+        sys.exit(1)
 
     state = load_state()
+    last_heartbeat_day = None
 
-    if not crous_email or not crous_password:
-        err_msg = "CROUS_EMAIL or CROUS_PASSWORD environment variable is missing."
-        logger.error(err_msg)
-        state["consecutive_failures"] += 1
-        save_state(state)
-        if state["consecutive_failures"] >= 3:
-            send_ntfy_notification(
-                topic=ntfy_topic,
-                title="🚨 CROUS Watcher Alert: Configuration Error",
-                message=f"Script failed {state['consecutive_failures']} times in a row.\n\nError: {err_msg}",
-                tags="warning,rotating_light"
-            )
-        sys.exit(1)
+    # Send startup announcement to Telegram
+    startup_msg = (
+        "🚀 *CROUS Watcher Démarré sur votre VPS !*\n\n"
+        f"🎯 *Ville :* {TARGET_CITY.capitalize()}\n"
+        f"💶 *Loyer Max :* {MAX_PRICE} €\n"
+        f"⏱️ *Fréquence de scan :* Toutes les ~{CHECK_INTERVAL_SECONDS} secondes\n\n"
+        "Je surveille en continu 24h/24. Envoyez `/status` pour voir les métriques ou `/check` pour vérifier."
+    )
+    send_telegram_message(startup_msg)
 
-    try:
-        async with async_playwright() as p:
-            logger.info("Launching headless Chromium browser...")
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-            page = await context.new_page()
+    while RUNNING:
+        try:
+            # 1. Check for incoming Telegram commands (/status, /check, /test)
+            poll_telegram_updates(on_check_callback=check_and_notify)
 
-            # 1. Fresh Authentication
-            await login_crous(page, crous_email, crous_password)
-
-            # Check if test mode requested via workflow_dispatch input or env var
-            if os.getenv("TEST_NOTIFICATION", "").lower() in ("true", "1", "yes"):
-                logger.info("TEST_NOTIFICATION requested. Sending test alert with real CROUS listing...")
-                test_title = "🏠 CROUS Test Alert: Cité Guérin"
-                test_body = (
-                    "Logement: Cité Guérin (Test)\n"
-                    "Prix: 266.62 €\n"
-                    "Surface: 12 m²\n"
-                    "Adresse: 39A rue Camille Guérin 87038 LIMOGES CEDEX\n"
-                    "Lien: https://trouverunlogement.lescrous.fr/tools/42/accommodations/285"
+            # 2. Daily morning heartbeat (09:00 UTC)
+            now = datetime.now(timezone.utc)
+            if ENABLE_DAILY_HEARTBEAT and now.hour == 9 and last_heartbeat_day != now.date():
+                last_heartbeat_day = now.date()
+                send_telegram_message(
+                    "☀️ *Bonjour ! CROUS Watcher est bien actif.*\n"
+                    f"Surveillance 24/7 en cours pour {TARGET_CITY.capitalize()}.\n"
+                    f"Offres actives en France : {METRICS['last_active_listings_count']}."
                 )
-                test_link = "https://trouverunlogement.lescrous.fr/tools/42/accommodations/285"
-                send_ntfy_notification(
-                    topic=ntfy_topic,
-                    title=test_title,
-                    message=test_body,
-                    tags="house,euro",
-                    link=test_link
+
+            # 3. Run search check
+            check_and_notify()
+
+        except Exception as err:
+            logger.exception(f"Unexpected error in watcher cycle: {err}")
+            state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+            save_state(state)
+            append_run_history("FAILURE", f"{err} | Consecutive: {state['consecutive_failures']}")
+
+            # Alert after 5 consecutive failures
+            if state["consecutive_failures"] == 5:
+                send_telegram_message(
+                    f"🚨 *Alerte Watcher : 5 échecs consécutifs*\n\n"
+                    f"Dernière erreur : `{str(err)[:200]}`\n"
+                    "Vérifiez les logs sur votre VPS (`journalctl -u crous-watcher`)."
                 )
-                await browser.close()
-                state["consecutive_failures"] = 0
-                save_state(state)
-                append_run_history_log("TEST", "Sent test notification with live listing Cité Guérin.")
-                logger.info("Test notification sent successfully. Exiting test run.")
-                return
 
-            # 2. Search listings
-            current_listings = await search_listings(page)
+        # 4. Sleep with random jitter (+/- 5 seconds) to avoid static pattern detection
+        jitter = random.uniform(-4.0, 6.0)
+        sleep_time = max(15.0, CHECK_INTERVAL_SECONDS + jitter)
 
-            await browser.close()
+        # Break sleep into 1-second chunks so incoming commands or signals are handled fast
+        for _ in range(int(sleep_time)):
+            if not RUNNING:
+                break
+            poll_telegram_updates(on_check_callback=check_and_notify)
+            time.sleep(1)
 
-        # Compare against seen state
-        seen_set = set(state.get("seen_ids", []))
-        new_listings = [item for item in current_listings if item["id"] not in seen_set]
-
-        logger.info(f"Total current listings: {len(current_listings)} | New listings: {len(new_listings)}")
-
-        # 3. Process new listings
-        for item in new_listings:
-            title = f"🏠 CROUS Marseille: {item['name']}"
-            body = (
-                f"Logement: {item['name']}\n"
-                f"Prix: {item['price']}\n"
-                f"Surface: {item['surface']}\n"
-                f"Adresse: {item['address']}\n"
-                f"Lien: {item['link']}"
-            )
-            send_ntfy_notification(
-                topic=ntfy_topic,
-                title=title,
-                message=body,
-                tags="house,euro",
-                link=item["link"]
-            )
-            state["seen_ids"].append(item["id"])
-
-        # Reset failure counter on success
-        state["consecutive_failures"] = 0
-        save_state(state)
-
-        summary = f"Check completed. Listings found: {len(current_listings)} | New: {len(new_listings)} | Total seen: {len(state['seen_ids'])}"
-        append_run_history_log("SUCCESS", summary)
-
-        if not new_listings:
-            logger.info("No new listings found. Exiting quietly.")
-
-    except Exception as err:
-        logger.exception("An error occurred during watcher execution")
-        state["consecutive_failures"] += 1
-        save_state(state)
-
-        append_run_history_log("FAILURE", f"{str(err)} | Consecutive failures: {state['consecutive_failures']}")
-
-        if state["consecutive_failures"] >= 3:
-            send_ntfy_notification(
-                topic=ntfy_topic,
-                title="🚨 CROUS Watcher Alert: Script Failure",
-                message=f"The CROUS watcher script has failed {state['consecutive_failures']} runs in a row.\n\nLatest Error: {str(err)}",
-                tags="warning,rotating_light"
-            )
-        sys.exit(1)
-
-
-def main():
-    import asyncio
-    asyncio.run(run_watcher())
+    logger.info("CROUS Watcher Daemon stopped cleanly.")
+    send_telegram_message("🛑 *CROUS Watcher arrêté sur le VPS.*")
 
 
 if __name__ == "__main__":
-    main()
+    main_loop()
