@@ -122,6 +122,14 @@ def apply_for_accommodation(
             logger.info(f"Navigating to request URL: {request_url}")
             resp = page.goto(request_url, wait_until="domcontentloaded")
 
+            # Check for HTTP 429 / 403
+            if resp and resp.status in (429, 403):
+                err = f"Rate limited or blocked by CROUS (HTTP {resp.status})."
+                logger.error(err)
+                result["error"] = err
+                result["step"] = "rate_limited"
+                return result
+
             # Check if redirected to login
             if "/mse/discovery/connect" in page.url or "login" in page.url:
                 err = "Session expired or invalid. Redirected to login page."
@@ -129,6 +137,20 @@ def apply_for_accommodation(
                 result["error"] = err
                 result["step"] = "auth_redirect"
                 return result
+
+            # Check if redirected to onboarding rules
+            if "/rules" in page.url:
+                logger.info("Encountered rules onboarding page. Bypassing...")
+                pass_btn = page.locator("button:has-text('Passer à la recherche'), a:has-text('Passer à la recherche')").first
+                if pass_btn.is_visible():
+                    pass_btn.click()
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                study_btn = page.locator("button[type='submit'], button:has-text('Continuer'), button:has-text('Valider')").first
+                if study_btn.is_visible():
+                    study_btn.click()
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                # Re-navigate
+                resp = page.goto(request_url, wait_until="domcontentloaded")
 
             # If request creation page is not directly found (e.g. 404), fallback to accommodation page
             if resp and resp.status == 404:
