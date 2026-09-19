@@ -28,6 +28,9 @@ fi
 "${APP_DIR}/venv/bin/pip" install --upgrade pip
 "${APP_DIR}/venv/bin/pip" install -r "${APP_DIR}/requirements.txt"
 
+echo "🎭 Installing Playwright Chromium browser & dependencies..."
+"${APP_DIR}/venv/bin/playwright" install --with-deps chromium
+
 # 3. Check for .env file
 if [ ! -f "${APP_DIR}/.env" ]; then
     echo "⚠️  No .env file found!"

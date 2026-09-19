@@ -9,3 +9,6 @@ __pycache__/
 *.html
 *.json
 !listings_seen.json
+session.json
+screenshots/
+.vscode/
