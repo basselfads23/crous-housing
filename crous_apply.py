@@ -102,11 +102,13 @@ def apply_for_accommodation(
         browser = p.chromium.launch(
             headless=True,
             args=[
-                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
-                "--disable-gpu"
-            ]
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+            ignore_default_args=["--enable-automation"],
         )
         context = browser.new_context(
             storage_state=str(SESSION_FILE),
@@ -117,14 +119,15 @@ def apply_for_accommodation(
         page.set_default_timeout(timeout_seconds * 1000)
 
         try:
-            # 1. Direct navigation to the request creation page
+            # 1. First visit the accommodation page to ensure it's added to cart selection
+            acc_url = f"https://trouverunlogement.lescrous.fr/tools/{tool_id}/accommodations/{accommodation_id}"
             request_url = f"https://trouverunlogement.lescrous.fr/tools/{tool_id}/cart/requests/create/{accommodation_id}"
-            logger.info(f"Navigating to request URL: {request_url}")
-            resp = page.goto(request_url, wait_until="domcontentloaded")
+            logger.info(f"Navigating to accommodation page: {acc_url}")
+            resp = page.goto(acc_url, wait_until="domcontentloaded")
 
-            # Check for HTTP 429 / 403
-            if resp and resp.status in (429, 403):
-                err = f"Rate limited or blocked by CROUS (HTTP {resp.status})."
+            # Check for Rate Limit (HTTP 429)
+            if resp and resp.status == 429:
+                err = "Rate limited by CROUS (HTTP 429)."
                 logger.error(err)
                 result["error"] = err
                 result["step"] = "rate_limited"
@@ -149,28 +152,66 @@ def apply_for_accommodation(
                 if study_btn.is_visible():
                     study_btn.click()
                     page.wait_for_load_state("networkidle", timeout=5000)
-                # Re-navigate
-                resp = page.goto(request_url, wait_until="domcontentloaded")
+                # Re-navigate to accommodation
+                resp = page.goto(acc_url, wait_until="domcontentloaded")
 
-            # If request creation page is not directly found (e.g. 404), fallback to accommodation page
-            if resp and resp.status == 404:
-                acc_url = f"https://trouverunlogement.lescrous.fr/tools/{tool_id}/accommodations/{accommodation_id}"
-                logger.info(f"Request page 404. Trying accommodation page: {acc_url}")
-                page.goto(acc_url, wait_until="networkidle")
-                # Look for 'Ajouter à ma sélection'
-                add_btn = page.locator("button:has-text('Ajouter à ma sélection'), button[title*='sélection']").first
-                if add_btn.is_visible():
-                    add_btn.click()
-                    page.wait_for_timeout(1000)
-                    page.goto(request_url, wait_until="networkidle")
+            # Look for 'Ajouter à ma sélection'
+            add_btn = page.locator("button:has-text('Ajouter à ma sélection'), button[title*='sélection']").first
+            if add_btn.is_visible():
+                logger.info("Clicking 'Ajouter à ma sélection'...")
+                add_btn.click()
+                page.wait_for_timeout(1500)
+
+            # 2. Navigate to request creation page
+            logger.info(f"Navigating to request URL: {request_url}")
+            resp = page.goto(request_url, wait_until="domcontentloaded")
+
+            # Check for Rate Limit (HTTP 429)
+            if resp and resp.status == 429:
+                err = "Rate limited by CROUS (HTTP 429)."
+                logger.error(err)
+                result["error"] = err
+                result["step"] = "rate_limited"
+                return result
+
+            # Check for HTTP 403
+            if resp and resp.status == 403:
+                body_text = page.inner_text("body").lower()
+                if "sélection" in body_text or "selection" in body_text or "ne pouvez pas demander" in body_text:
+                    err = "Le logement n'est pas disponible à la réservation (logement complet ou non réservable)."
+                    logger.warning(err)
+                    result["error"] = err
+                    result["step"] = "not_reservable"
+                else:
+                    err = "Accès refusé par CROUS (HTTP 403)."
+                    logger.error(err)
+                    result["error"] = err
+                    result["step"] = "forbidden"
+                return result
+
+            # Check if redirected to login
+            if "/mse/discovery/connect" in page.url or "login" in page.url:
+                err = "Session expired or invalid. Redirected to login page."
+                logger.error(err)
+                result["error"] = err
+                result["step"] = "auth_redirect"
+                return result
 
             # Wait for form container to load
             result["step"] = "form_loading"
             page.wait_for_selector("form, .CartRequestPage, .fr-fieldset", timeout=10000)
             logger.info("Request form loaded successfully.")
 
-            # 2. Fill Occupation Mode
+            # 3. Fill Occupation Mode (support radio button and select dropdown)
             result["step"] = "filling_fields"
+            radio_label = page.locator("label:has-text('Individuel'), .fr-radio-group label, label[for*='occupationMode']").first
+            if radio_label.is_visible():
+                radio_label.click()
+            else:
+                radios = page.locator("input[type='radio']").all()
+                if radios:
+                    radios[0].check(force=True)
+
             mode_select = page.locator("select[name*='occupationMode'], select#ModalitiesForm-occupationMode, select").first
             if mode_select.is_visible():
                 options = mode_select.locator("option").all_inner_texts()
@@ -207,16 +248,20 @@ def apply_for_accommodation(
                 elif not ALREADY_ACCOMMODATED and already_acc_box.is_checked():
                     already_acc_box.uncheck()
 
-            # 3. Advance to Review / Summary Step
+            # 4. Advance to Review / Summary Step
             result["step"] = "submitting_form_step"
-            # Look for step forward button (e.g. "Suivant", "Soumettre", arrow button)
-            step_btn = page.locator("button[type='submit'], button.fr-fi-arrow-right-line, form button.fr-btn").first
-            if step_btn.is_visible():
-                step_btn.click()
-                logger.info("Clicked form step submit button.")
+            verify_btn = page.locator("button:has-text('Vérifier ma demande'), button:has-text('Vérifier')").first
+            if verify_btn.is_visible():
+                verify_btn.click()
+                logger.info("Clicked 'Vérifier ma demande' button.")
+            else:
+                step_btn = page.locator("button[type='submit'], form button.fr-btn").first
+                if step_btn.is_visible():
+                    step_btn.click()
+                    logger.info("Clicked form step submit button.")
 
             # Wait for summary step or confirmation button
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(2000)
             result["step"] = "summary_review"
 
             # Check if we have reached the summary / confirmation stage
@@ -224,7 +269,7 @@ def apply_for_accommodation(
                 "button:has-text('Confirmer ma demande'), button:has-text('Soumettre'), button:has-text('Valider ma demande')"
             ).first
 
-            # 4. Handle DRY-RUN vs LIVE
+            # 5. Handle DRY-RUN vs LIVE
             screenshot_name = f"{'dry_run' if dry_run else 'applied'}_{accommodation_id}_{int(time.time())}.png"
             screenshot_file = SCREENSHOTS_DIR / screenshot_name
 

@@ -316,12 +316,12 @@ def handle_telegram_command(cmd: str, on_check_callback=None):
 
     elif cmd_lower == "/test_apply":
         send_telegram_message("🧪 *Lancement d'un test d'auto-candidature (Dry-Run)...*\nVeuillez patienter quelques secondes.")
-        sample_acc_id = "482"
+        sample_acc_id = "6"
         tool_id = "47"
         try:
             items = fetch_all_crous_listings(tool_id)
             if items:
-                sample_acc_id = str(items[0].get("id", "482"))
+                sample_acc_id = str(items[0].get("id", "6"))
         except Exception:
             pass
 
