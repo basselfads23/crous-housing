@@ -89,6 +89,7 @@ def is_session_valid() -> tuple[bool, str]:
 def run_login_flow(timeout_seconds: int = 300) -> bool:
     """
     Launch a visible browser for the user to log in interactively.
+    Uses stealth anti-detection flags so Altcha and F5 BIG-IP do not hang.
     Saves session.json once login succeeds.
     """
     try:
@@ -98,23 +99,59 @@ def run_login_flow(timeout_seconds: int = 300) -> bool:
         return False
 
     print("\n" + "=" * 65)
-    print("🔐 CROUS INTERACTIVE LOGIN HELPER")
+    print("🔐 CROUS INTERACTIVE LOGIN HELPER (STEALTH MODE)")
     print("=" * 65)
     print("1. A browser window will now open.")
     print("2. Enter your MesServicesEtudiant email and password.")
-    print("3. Complete the Altcha security check and 2FA (if prompted).")
+    print("3. Complete the Altcha security check and 2FA.")
     print("4. Once you are successfully logged in and redirected back to")
     print("   trouverunlogement.lescrous.fr, this script will automatically")
     print(f"   save your session to: {SESSION_FILE}")
     print("=" * 65 + "\n")
 
     with sync_playwright() as p:
-        # Launch visible browser
-        browser = p.chromium.launch(headless=False)
+        launch_kwargs = {
+            "headless": False,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-infobars",
+                "--start-maximized"
+            ],
+            "ignore_default_args": ["--enable-automation"]
+        }
+
+        # Try launching real installed Chrome first for best stealth
+        browser = None
+        try:
+            browser = p.chromium.launch(channel="chrome", **launch_kwargs)
+            logger.info("Using installed Google Chrome (Bypass mode active)")
+        except Exception:
+            try:
+                browser = p.chromium.launch(channel="msedge", **launch_kwargs)
+                logger.info("Using Microsoft Edge (Bypass mode active)")
+            except Exception:
+                browser = p.chromium.launch(**launch_kwargs)
+                logger.info("Using Chromium (Bypass mode active)")
+
         context = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            no_viewport=True,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         )
+
+        # Remove webdriver flag and disguise automation
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => false
+            });
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['fr-FR', 'fr', 'en-US', 'en']
+            });
+        """)
+
         page = context.new_page()
 
         login_url = "https://trouverunlogement.lescrous.fr/mse/discovery/connect"
@@ -131,7 +168,6 @@ def run_login_flow(timeout_seconds: int = 300) -> bool:
 
             # Check if returned to trouverunlogement.lescrous.fr
             if "trouverunlogement.lescrous.fr" in current_url and "/mse/discovery/connect" not in current_url:
-                # Let page settle
                 page.wait_for_load_state("networkidle", timeout=5000)
                 # Verify health endpoint
                 try:
@@ -161,15 +197,113 @@ def run_login_flow(timeout_seconds: int = 300) -> bool:
             return False
 
 
+def import_cookie_header(cookie_header: str) -> bool:
+    """
+    Import raw cookie string (e.g. from browser DevTools) into session.json.
+    Format: 'name1=val1; name2=val2; ...'
+    """
+    cookie_header = cookie_header.strip().strip('"').strip("'")
+    if not cookie_header:
+        logger.error("Empty cookie string provided.")
+        return False
+
+    cookies_list = []
+    pairs = [p.strip() for p in cookie_header.split(";") if "=" in p]
+    for p in pairs:
+        k, v = p.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        cookies_list.append({
+            "name": k,
+            "value": v,
+            "domain": ".trouverunlogement.lescrous.fr",
+            "path": "/",
+            "expires": -1,
+            "httpOnly": False,
+            "secure": True,
+            "sameSite": "Lax"
+        })
+
+    data = {
+        "cookies": cookies_list,
+        "origins": []
+    }
+
+    with open(SESSION_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    logger.info(f"Imported {len(cookies_list)} cookies into {SESSION_FILE}")
+    valid, msg = is_session_valid()
+    if valid:
+        logger.info(f"✅ Verified: {msg}")
+        return True
+    else:
+        logger.warning(f"⚠️ Saved, but verification returned: {msg}")
+        return False
+
+
+def import_json_file(file_path: str) -> bool:
+    """Import exported cookies JSON (e.g. from Cookie-Editor extension)."""
+    p = Path(file_path)
+    if not p.exists():
+        logger.error(f"File does not exist: {file_path}")
+        return False
+
+    with open(p, "r", encoding="utf-8") as f:
+        raw_data = json.load(f)
+
+    # If it's already in Playwright storage_state format
+    if isinstance(raw_data, dict) and "cookies" in raw_data:
+        with open(SESSION_FILE, "w", encoding="utf-8") as out:
+            json.dump(raw_data, out, indent=2)
+    # If it's a list from Cookie-Editor extension
+    elif isinstance(raw_data, list):
+        cookies_list = []
+        for c in raw_data:
+            cookies_list.append({
+                "name": c.get("name"),
+                "value": c.get("value"),
+                "domain": c.get("domain") or ".trouverunlogement.lescrous.fr",
+                "path": c.get("path") or "/",
+                "expires": c.get("expirationDate") or -1,
+                "httpOnly": c.get("httpOnly", False),
+                "secure": c.get("secure", True),
+                "sameSite": "Lax"
+            })
+        data = {"cookies": cookies_list, "origins": []}
+        with open(SESSION_FILE, "w", encoding="utf-8") as out:
+            json.dump(data, out, indent=2)
+    else:
+        logger.error("Unrecognized JSON format.")
+        return False
+
+    logger.info(f"Successfully converted cookies to {SESSION_FILE}")
+    valid, msg = is_session_valid()
+    if valid:
+        logger.info(f"✅ Verified: {msg}")
+        return True
+    else:
+        logger.warning(f"⚠️ Saved, but verification returned: {msg}")
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="CROUS Session Authentication Helper")
-    parser.add_argument("--login", action="store_true", help="Open visible browser to log in and save session.json")
+    parser.add_argument("--login", action="store_true", help="Open visible browser with stealth anti-detection")
     parser.add_argument("--check", action="store_true", help="Check if current session.json is valid")
+    parser.add_argument("--cookie-header", type=str, help="Import raw cookie header string from your regular browser")
+    parser.add_argument("--import-json", type=str, help="Import cookies from a JSON file (e.g. Cookie-Editor export)")
 
     args = parser.parse_args()
 
     if args.login:
         success = run_login_flow()
+        sys.exit(0 if success else 1)
+    elif args.cookie_header:
+        success = import_cookie_header(args.cookie_header)
+        sys.exit(0 if success else 1)
+    elif args.import_json:
+        success = import_json_file(args.import_json)
         sys.exit(0 if success else 1)
     elif args.check:
         valid, msg = is_session_valid()
@@ -180,13 +314,15 @@ def main():
             logger.warning(f"❌ {msg}")
             sys.exit(1)
     else:
-        # Default behavior: check, or show help
         valid, msg = is_session_valid()
         if valid:
             logger.info(f"✅ {msg}")
         else:
             logger.warning(f"❌ {msg}")
-            print("\nTo log in, run: python crous_auth.py --login")
+            print("\nOptions to authenticate:")
+            print("  1. Stealth browser: python crous_auth.py --login")
+            print("  2. Paste cookie:    python crous_auth.py --cookie-header \"<your_cookies>\"")
+            print("  3. Import JSON:     python crous_auth.py --import-json cookies.json")
 
 
 if __name__ == "__main__":
