@@ -84,12 +84,40 @@ NIGHT_CHECK_INTERVAL_SECONDS = int(os.getenv("NIGHT_CHECK_INTERVAL_SECONDS", "24
 # Automated Application (Sniper) Configuration
 AUTO_APPLY_ENABLED = os.getenv("AUTO_APPLY_ENABLED", "true").lower() in ("true", "1", "yes")
 AUTO_APPLY_DRY_RUN = os.getenv("AUTO_APPLY_DRY_RUN", "true").lower() in ("true", "1", "yes")
+AUTO_APPLY_ANY_MAX_PRICE = float(os.getenv("AUTO_APPLY_ANY_MAX_PRICE", "300"))
+AUTO_APPLY_SINGLE_MAX_PRICE = float(os.getenv("AUTO_APPLY_SINGLE_MAX_PRICE", "350"))
+# Proxy manager integration
+try:
+    import proxy_manager
+except ImportError:
+    proxy_manager = None
+
+try:
+    import activity_logger
+except ImportError:
+    activity_logger = None
+
+def get_crous_opener_and_proxy(rotate: bool = False):
+    handlers = []
+    proxy_url = proxy_manager.get_current_proxy(rotate=rotate) if proxy_manager else (os.getenv("CROUS_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY"))
+    if proxy_url:
+        handlers.append(urllib.request.ProxyHandler({
+            "http": proxy_url,
+            "https": proxy_url,
+        }))
+    return urllib.request.build_opener(*handlers), proxy_url
+
+def get_crous_opener(rotate: bool = False):
+    opener, _ = get_crous_opener_and_proxy(rotate=rotate)
+    return opener
+
 
 # Optional modules: crous_auth and crous_apply
 try:
-    from crous_auth import is_session_valid, SESSION_FILE
+    from crous_auth import is_session_valid, auto_login, SESSION_FILE
 except ImportError:
     is_session_valid = lambda: (False, "crous_auth module not found")
+    auto_login = lambda: (False, "crous_auth module not found")
     SESSION_FILE = BASE_DIR / "session.json"
 
 try:
@@ -133,6 +161,18 @@ def get_smart_cadence() -> tuple[int, str]:
         return NIGHT_CHECK_INTERVAL_SECONDS, "🌙 Nuit (Pause/Éco)"
 
 
+def get_next_run_estimate() -> str:
+    """Returns human-friendly estimate for the next check cycle."""
+    try:
+        cadence_seconds, _ = get_smart_cadence()
+        if cadence_seconds < 60:
+            return f"{int(cadence_seconds)} seconds"
+        mins = round(cadence_seconds / 60)
+        return f"{mins} minutes"
+    except Exception:
+        return "N/A"
+
+
 # Global runtime metrics
 METRICS = {
     "start_time": datetime.now(timezone.utc),
@@ -145,6 +185,7 @@ METRICS = {
 }
 
 RUNNING = True
+PAUSED = False
 
 
 def handle_shutdown(signum, frame):
@@ -253,6 +294,7 @@ def poll_telegram_updates(on_check_callback=None):
 
 def handle_telegram_command(cmd: str, on_check_callback=None):
     """Execute interactive Telegram commands."""
+    global PAUSED, RUNNING
     cmd_lower = cmd.lower()
     logger.info(f"Received Telegram command: {cmd}")
 
@@ -260,16 +302,41 @@ def handle_telegram_command(cmd: str, on_check_callback=None):
         help_text = (
             "🤖 *CROUS Watcher Bot - Commandes Disponibles*\n\n"
             "• `/status` : État du watcher, cadence et métriques\n"
+            "• `/pause` : Mettre en pause la surveillance automatique\n"
+            "• `/resume` : Reprendre la surveillance automatique\n"
+            "• `/stop` : Arrêter complètement le bot sur le VPS\n"
             "• `/check` : Lancer une vérification immédiate\n"
             "• `/session` : Vérifier la validité de l'authentification CROUS\n"
+            "• `/renew` : Renouvellement automatique de la session CROUS\n"
             "• `/test_apply` : Tester l'auto-candidature (Dry-Run avec capture)\n"
             "• `/test` : Envoyer une notification de test\n"
             "• `/help` : Afficher ce message d'aide\n\n"
             f"🎯 *Ville ciblée :* {TARGET_CITY.capitalize()}\n"
-            f"💶 *Prix max :* {MAX_PRICE:.2f} €\n"
-            f"🤖 *Auto-Apply :* {'DRY-RUN' if AUTO_APPLY_DRY_RUN else 'LIVE' if AUTO_APPLY_ENABLED else 'Désactivé'}"
+            f"⚡ *Sniper immédiat :* < {AUTO_APPLY_ANY_MAX_PRICE:.0f} € (Individuel ou Colocation)\n"
+            f"🎯 *Sniper ciblé :* {AUTO_APPLY_ANY_MAX_PRICE:.0f} € – {AUTO_APPLY_SINGLE_MAX_PRICE:.0f} € (Individuel uniquement)\n"
+            f"📢 *Alerte Telegram seule :* Jusqu'à {MAX_PRICE:.0f} € (Réservation manuelle)\n"
+            f"🤖 *Mode Sniper :* {'🧪 DRY-RUN' if AUTO_APPLY_DRY_RUN else '⚡ LIVE' if AUTO_APPLY_ENABLED else 'Désactivé'}"
         )
         send_telegram_message(help_text)
+
+    elif cmd_lower == "/pause":
+        PAUSED = True
+        send_telegram_message(
+            "⏸️ *CROUS Watcher mis en pause*\n\n"
+            "Toutes les recherches et candidatures automatiques sont suspendues.\n"
+            "Tapez `/resume` pour réactiver la surveillance à tout moment."
+        )
+
+    elif cmd_lower == "/resume":
+        PAUSED = False
+        send_telegram_message(
+            "▶️ *CROUS Watcher réactivé*\n\n"
+            "La surveillance 24/7 a repris normalement !"
+        )
+
+    elif cmd_lower in ("/stop", "/shutdown"):
+        send_telegram_message("🛑 *Arrêt du CROUS Watcher...*\nLe processus s'éteint.")
+        RUNNING = False
 
     elif cmd_lower == "/status":
         uptime = datetime.now(timezone.utc) - METRICS["start_time"]
@@ -282,18 +349,28 @@ def handle_telegram_command(cmd: str, on_check_callback=None):
         interval, cadence_label = get_smart_cadence()
         is_logged_in, session_msg = is_session_valid()
 
+        total_proxies = len(proxy_manager.load_proxies()) if proxy_manager else 0
+        current_proxy = proxy_manager.get_current_proxy() if proxy_manager else "Aucun"
+        proxy_display = current_proxy.split("@")[-1] if (current_proxy and "@" in current_proxy) else current_proxy
+
+        header_icon = "⏸️" if PAUSED else "🟢"
+        header_text = "CROUS Watcher en PAUSE (Tapez /resume)" if PAUSED else "CROUS Watcher Actif (24/7)"
+
         status_text = (
-            "🟢 *CROUS Watcher Actif (24/7)*\n\n"
+            f"{header_icon} *{header_text}*\n\n"
             f"⏱️ *Uptime :* {uptime_str}\n"
             f"🔄 *Vérifications totales :* {METRICS['total_checks']}\n"
             f"🕒 *Dernière vérification :* {last_check}\n"
             f"⏱️ *Cadence :* ~{interval}s ({cadence_label})\n"
+            f"🌐 *Proxies :* {total_proxies} actifs (Actuel : `{proxy_display}`)\n"
             f"🇫🇷 *Offres actives en France :* {METRICS['last_active_listings_count']}\n"
             f"💾 *Offres déjà enregistrées :* {len(state.get('seen_ids', []))}\n"
             f"⚠️ *Échecs consécutifs :* {state.get('consecutive_failures', 0)}\n\n"
             f"🔐 *Session CROUS :* {'Connecté ✅' if is_logged_in else 'Non connecté / Expiré ❌'}\n"
-            f"🤖 *Auto-Apply :* {'🧪 DRY-RUN' if AUTO_APPLY_DRY_RUN else '⚡ LIVE' if AUTO_APPLY_ENABLED else 'Désactivé'}\n"
-            f"🎯 *Cible :* {TARGET_CITY.capitalize()} (≤ {MAX_PRICE} €)"
+            f"⚡ *Sniper < {AUTO_APPLY_ANY_MAX_PRICE:.0f} € :* Tout mode ({'🧪 DRY-RUN' if AUTO_APPLY_DRY_RUN else '⚡ LIVE'})\n"
+            f"🎯 *Sniper {AUTO_APPLY_ANY_MAX_PRICE:.0f}–{AUTO_APPLY_SINGLE_MAX_PRICE:.0f} € :* Individuel seul ({'🧪 DRY-RUN' if AUTO_APPLY_DRY_RUN else '⚡ LIVE'})\n"
+            f"📢 *Alerte seule :* {AUTO_APPLY_SINGLE_MAX_PRICE:.0f} € – {MAX_PRICE:.0f} € (et Coloc 300–400€)\n"
+            f"🎯 *Cible :* {TARGET_CITY.capitalize()}"
         )
         send_telegram_message(status_text)
 
@@ -309,10 +386,31 @@ def handle_telegram_command(cmd: str, on_check_callback=None):
             send_telegram_message(
                 "🔴 *Session CROUS Invalide ou Expirée*\n\n"
                 f"❌ {session_msg}\n\n"
-                "Pour renouveler la session :\n"
-                "1. Sur votre PC : `python crous_auth.py --login`\n"
-                "2. Transférez `session.json` sur le VPS."
+                "Tapez `/renew` pour tenter une reconnexion automatique avec vos identifiants."
             )
+
+    elif cmd_lower == "/renew":
+        send_telegram_message("🔄 *Tentative de reconnexion automatique en cours...*\nVeuillez patienter 15 à 25 secondes.")
+        try:
+            renewed, renew_msg = auto_login()
+            if renewed:
+                send_telegram_message("🟢 *Reconnexion réussie !*\n\nLa session CROUS est active et valide ✅.")
+            else:
+                if any(x in str(renew_msg).lower() for x in ("111", "connection refused", "err_connection_refused")):
+                    send_telegram_message(
+                        "🔴 *Pare-feu CROUS temporairement fermé (Connection Refused)*\n\n"
+                        "L'adresse IP de ce VPS a atteint le seuil de limitation de requêtes du CROUS.\n\n"
+                        "⏳ *Action requise :* Laissez reposer 15 à 30 minutes sans envoyer de requêtes pour que le pare-feu débloque automatiquement l'accès.\n"
+                        "💡 *Alternative :* Vous pouvez également renseigner `CROUS_PROXY` dans `.env` si vous disposez d'un proxy."
+                    )
+                else:
+                    send_telegram_message(
+                        "🔴 *Échec de la reconnexion automatique*\n\n"
+                        f"Raison : `{renew_msg}`\n\n"
+                        "Assurez-vous que `CROUS_EMAIL` et `CROUS_PASSWORD` sont renseignés dans le fichier `.env`."
+                    )
+        except Exception as renew_err:
+            send_telegram_message(f"❌ *Erreur système lors du renouvellement :* `{renew_err}`")
 
     elif cmd_lower == "/test_apply":
         send_telegram_message("🧪 *Lancement d'un test d'auto-candidature (Dry-Run)...*\nVeuillez patienter quelques secondes.")
@@ -340,11 +438,25 @@ def handle_telegram_command(cmd: str, on_check_callback=None):
                 else:
                     send_telegram_message(caption)
             else:
-                err_caption = (
-                    f"❌ *[ÉCHEC DU TEST DRY-RUN]*\n\n"
-                    f"• Erreur : `{res.get('error')}`\n"
-                    f"• Étape : `{res.get('step')}`"
-                )
+                err_str = str(res.get("error"))
+                if any(x in err_str.lower() for x in ("111", "connection refused", "err_connection_refused")):
+                    err_caption = (
+                        "❌ *[TEST DRY-RUN SUSPENDU - PARE-FEU CROUS]*\n\n"
+                        "L'accès à `trouverunlogement.lescrous.fr` a été temporairement refusé par le site.\n\n"
+                        "⏳ Le bot utilise automatiquement les autres proxys du pool."
+                    )
+                elif "429" in err_str or res.get("step") == "rate_limited":
+                    err_caption = (
+                        "❌ *[TEST DRY-RUN - PAUSE SUR CE PROXY (429)]*\n\n"
+                        "Ce proxy précis a temporairement reçu trop de requêtes.\n\n"
+                        "🔄 *Action automatique :* Le bot fait tourner la liste et utilisera un proxy différent au prochain essai."
+                    )
+                else:
+                    err_caption = (
+                        f"❌ *[ÉCHEC DU TEST DRY-RUN]*\n\n"
+                        f"• Erreur : `{res.get('error')}`\n"
+                        f"• Étape : `{res.get('step')}`"
+                    )
                 if res.get("screenshot_path"):
                     send_telegram_photo(res["screenshot_path"], err_caption)
                 else:
@@ -448,20 +560,32 @@ def append_run_history(status: str, summary: str) -> None:
 # ==============================================================================
 
 def discover_tool_ids() -> list[str]:
-    """Dynamically discover active tool IDs from the CROUS homepage."""
+    """Dynamically discover active tool IDs from the CROUS homepage using proxy."""
     url = "https://trouverunlogement.lescrous.fr/"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
     }
+    proxy_url = None
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        opener, proxy_url = get_crous_opener_and_proxy(rotate=False)
+        with opener.open(req, timeout=10) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
+            if activity_logger:
+                activity_logger.log_scouter_attempt(proxy_url, url, success=True, next_run="2-3 seconds")
             import re
             found = set(re.findall(r"/tools/(\d+)", html))
             if found:
                 return sorted(list(found))
     except Exception as err:
+        if activity_logger:
+            activity_logger.log_scouter_attempt(
+                proxy_url,
+                url,
+                success=False,
+                error_message=f"Découverte d'outils échouée : {err}",
+                next_run="2-3 seconds"
+            )
         logger.debug(f"Tool discovery fallback: {err}")
 
     # Default fallback
@@ -472,6 +596,7 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
     """
     Fetch all active listings for the given tool_id via the internal search REST API.
     Paginates automatically until all items are collected.
+    Uses proxy rotation and automatic retry if an individual proxy fails.
     """
     all_items = []
     page = 1
@@ -484,6 +609,7 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
         "Referer": f"https://trouverunlogement.lescrous.fr/tools/{tool_id}/search"
     }
 
+    max_proxy_retries = 3
     while True:
         body = {"page": page}
         req = urllib.request.Request(
@@ -492,16 +618,61 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
             headers=headers
         )
 
-        try:
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as http_err:
-            if http_err.code in (403, 429):
-                raise CrousBlockedOrRateLimitedError(
-                    http_err.code,
-                    f"Accès refusé ou rate limit (HTTP {http_err.code}) sur l'API CROUS ({url})"
-                )
-            raise
+        data = None
+        last_error = None
+        for attempt in range(max_proxy_retries):
+            opener, proxy_url = get_crous_opener_and_proxy(rotate=(attempt > 0))
+            try:
+                with opener.open(req, timeout=12) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    break
+            except urllib.error.HTTPError as http_err:
+                last_error = http_err
+                retry_str = "Retrying with next proxy..." if (attempt < max_proxy_retries - 1) else get_next_run_estimate()
+                if activity_logger:
+                    activity_logger.log_scouter_attempt(
+                        proxy_url,
+                        url,
+                        success=False,
+                        error_message=f"HTTP {http_err.code} sur l'API CROUS ({http_err.reason})",
+                        next_run=retry_str
+                    )
+                if http_err.code in (403, 429):
+                    if attempt < max_proxy_retries - 1 and proxy_manager:
+                        logger.warning(f"HTTP {http_err.code} on current proxy. Rotating to next proxy...")
+                        proxy_manager.rotate_proxy()
+                        continue
+                    raise CrousBlockedOrRateLimitedError(
+                        http_err.code,
+                        f"Accès refusé ou rate limit (HTTP {http_err.code}) sur l'API CROUS ({url})"
+                    )
+                if attempt < max_proxy_retries - 1 and proxy_manager:
+                    logger.warning(f"HTTP {http_err.code} on proxy. Rotating proxy and retrying...")
+                    proxy_manager.rotate_proxy()
+            except Exception as err:
+                last_error = err
+                retry_str = "Retrying with next proxy..." if (attempt < max_proxy_retries - 1) else get_next_run_estimate()
+                if activity_logger:
+                    activity_logger.log_scouter_attempt(
+                        proxy_url,
+                        url,
+                        success=False,
+                        error_message=f"Erreur réseau sur le proxy ({err})",
+                        next_run=retry_str
+                    )
+                if attempt < max_proxy_retries - 1 and proxy_manager:
+                    logger.warning(f"Network issue on proxy: {err}. Rotating to next proxy...")
+                    proxy_manager.rotate_proxy()
+                else:
+                    err_str = str(err)
+                    if "111" in err_str or "connection refused" in err_str.lower():
+                        raise CrousBlockedOrRateLimitedError(code=111, message="Connection refused by CROUS firewall") from err
+                    raise
+
+        if data is None:
+            if last_error:
+                raise last_error
+            break
 
         results = data.get("results", {})
         items = results.get("items", [])
@@ -511,29 +682,34 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
         if total_expected is None and total_val is not None:
             total_expected = total_val
 
-        if not items:
-            break
-
         all_items.extend(items)
 
-        # If we've collected all items, exit pagination
-        if total_expected and len(all_items) >= total_expected:
-            break
+        # Check if more pages exist
+        is_last_page = False
+        if not items or len(items) < 20 or (total_expected and len(all_items) >= total_expected) or page >= 10:
+            is_last_page = True
 
-        # If less than 20 items returned, we are on the last page
-        if len(items) < 20:
+        next_run_str = get_next_run_estimate() if is_last_page else "2-3 seconds"
+        if activity_logger:
+            activity_logger.log_scouter_attempt(proxy_url, url, success=True, next_run=next_run_str)
+
+        if is_last_page:
             break
 
         page += 1
-        if page > 10:  # safety ceiling
-            break
+        # Human-like delay between pages (random 2 to 3 seconds)
+        time.sleep(random.uniform(2.0, 3.0))
 
     return all_items
 
 
 def is_target_listing(item: dict) -> tuple[bool, dict]:
     """
-    Filter item according to TARGET_CITY, MAX_PRICE, and COLOCATION_ONLY.
+    Filter item according to TARGET_CITY, MAX_PRICE, and dual-tier auto-apply rules:
+    - Tier 1: rent < AUTO_APPLY_ANY_MAX_PRICE (300€) -> Snipe immediately, any mode (single or colocation)!
+    - Tier 2: 300€ <= rent <= AUTO_APPLY_SINGLE_MAX_PRICE (350€) -> Snipe ONLY IF individual (single) mode is available!
+    - Tier 3: 350€ < rent <= MAX_PRICE (400€) (or colocation in 300-400€) -> Alert only via Telegram, do NOT auto-apply.
+    - Tier 4: rent > MAX_PRICE (400€) -> Discard completely.
     Returns (matches, parsed_info_dict).
     """
     item_id = str(item.get("id", ""))
@@ -549,27 +725,33 @@ def is_target_listing(item: dict) -> tuple[bool, dict]:
 
     # Occupation modes and rent calculation
     occupation_modes = item.get("occupationModes", [])
-    rents = []
+    single_rents = []
+    coloc_rents = []
+    all_rents = []
     is_colocation = False
 
     for mode in occupation_modes:
         m_type = mode.get("type", "").lower()
-        if "sharing" in m_type or "coloc" in m_type:
-            is_colocation = True
         rent_info = mode.get("rent", {})
         min_rent = rent_info.get("min") or rent_info.get("max")
         if min_rent is not None:
-            # Rent in API is in cents (e.g. 28050 -> 280.50€)
-            if min_rent > 1000:
-                rents.append(min_rent / 100.0)
-            else:
-                rents.append(float(min_rent))
+            rent_val = (min_rent / 100.0) if min_rent > 1000 else float(min_rent)
+            all_rents.append(rent_val)
+            if "alone" in m_type or "single" in m_type or "indiv" in m_type:
+                single_rents.append(rent_val)
+            elif "sharing" in m_type or "coloc" in m_type:
+                coloc_rents.append(rent_val)
+                is_colocation = True
 
-    if not rents:
+    if not all_rents:
         raw_price = item.get("price") or 0
-        rents.append(raw_price / 100.0 if raw_price > 1000 else float(raw_price))
-
-    lowest_rent = min(rents) if rents else 9999.0
+        rent_val = raw_price / 100.0 if raw_price > 1000 else float(raw_price)
+        all_rents.append(rent_val)
+        if "coloc" in room_label.lower():
+            coloc_rents.append(rent_val)
+            is_colocation = True
+        else:
+            single_rents.append(rent_val)
 
     # 1. Location match: Marseille city or postal codes 13001-13016 (or 'all' for nationwide)
     if TARGET_CITY in ("all", "*", ""):
@@ -586,22 +768,58 @@ def is_target_listing(item: dict) -> tuple[bool, dict]:
     if not city_match:
         return False, {}
 
-    # 2. Price filter
-    if lowest_rent > MAX_PRICE:
+    # 2. Dual-tier auto-apply & pricing evaluation
+    min_single_rent = min(single_rents) if single_rents else None
+    min_coloc_rent = min(coloc_rents) if coloc_rents else None
+    overall_min_rent = min(all_rents) if all_rents else 0.0
+
+    # If minimum rent is above MAX_PRICE (400€), ignore completely
+    if overall_min_rent > MAX_PRICE:
         return False, {}
 
-    # 3. Colocation filter
+    # 3. Colocation only filter if configured
     if COLOCATION_ONLY and not is_colocation and "coloc" not in room_label.lower():
         return False, {}
+
+    should_auto_apply = False
+    chosen_mode = "single"
+    effective_rent = overall_min_rent
+
+    if AUTO_APPLY_ENABLED:
+        # Check single mode under 350€ or 300€
+        if min_single_rent is not None and min_single_rent <= AUTO_APPLY_SINGLE_MAX_PRICE:
+            should_auto_apply = True
+            chosen_mode = "single"
+            effective_rent = min_single_rent
+        # Check colocation mode under 300€
+        elif min_coloc_rent is not None and min_coloc_rent < AUTO_APPLY_ANY_MAX_PRICE:
+            should_auto_apply = True
+            chosen_mode = "colocation"
+            effective_rent = min_coloc_rent
+
+    if not should_auto_apply:
+        # For manual alerts: prioritize single rent if <= MAX_PRICE, else coloc / overall min
+        if min_single_rent is not None and min_single_rent <= MAX_PRICE:
+            effective_rent = min_single_rent
+            chosen_mode = "single"
+        elif min_coloc_rent is not None and min_coloc_rent <= MAX_PRICE:
+            effective_rent = min_coloc_rent
+            chosen_mode = "colocation"
+        else:
+            effective_rent = overall_min_rent
+            chosen_mode = "single"
 
     parsed = {
         "id": item_id,
         "residence_name": residence_name,
         "label": room_label,
         "surface": surface,
-        "price": f"{lowest_rent:.2f}",
+        "price": f"{effective_rent:.2f}",
+        "raw_price": effective_rent,
         "address": address or "Marseille",
-        "is_coloc": is_colocation
+        "is_coloc": (chosen_mode == "colocation"),
+        "target_mode": chosen_mode,
+        "should_auto_apply": should_auto_apply
     }
     return True, parsed
 
@@ -611,18 +829,24 @@ def check_and_notify() -> tuple[int, int]:
     Core check cycle:
     1. Fetches listings from active CROUS tool(s).
     2. Identifies new matching listings in Marseille.
-    3. Sends Telegram notifications with direct action button.
-    4. Updates listings_seen.json.
+    3. Triggers immediate auto-apply if rent <= AUTO_APPLY_MAX_PRICE (330€).
+    4. Sends Telegram alert (with sniper screenshot if applied, or manual link if 330-400€).
+    5. Updates listings_seen.json.
     Returns (total_matching_in_marseille, new_alerts_sent).
     """
     state = load_state()
     seen_ids = set(str(i) for i in state.get("seen_ids", []))
 
     tool_ids = discover_tool_ids()
+    # Natural delay between homepage check and search requests (random 2 to 3 seconds)
+    time.sleep(random.uniform(2.0, 3.0))
+
     all_raw_items = []
     errors_encountered = []
 
-    for tid in tool_ids:
+    for idx, tid in enumerate(tool_ids):
+        if idx > 0:
+            time.sleep(random.uniform(2.0, 3.0))
         try:
             items = fetch_all_crous_listings(tid)
             for it in items:
@@ -633,10 +857,14 @@ def check_and_notify() -> tuple[int, int]:
             send_telegram_message(
                 f"🚨 *ALERTE CRITIQUE : Restriction d'accès CROUS (HTTP {err.code})*\n\n"
                 "Votre adresse IP semble être temporairement bloquée ou limitée par CROUS.\n"
-                "Le watcher va faire une pause de sécurité de 5 minutes pour protéger votre IP."
+                "Le watcher va faire une pause de sécurité de 10 minutes pour protéger votre IP."
             )
             raise
         except Exception as err:
+            err_str = str(err)
+            if "111" in err_str or "connection refused" in err_str.lower():
+                logger.critical(f"Connection refused by CROUS firewall on tool {tid}: {err}")
+                raise CrousBlockedOrRateLimitedError(code=111, message="Connection refused by CROUS firewall") from err
             logger.warning(f"Error fetching tool {tid}: {err}")
             errors_encountered.append(err)
 
@@ -658,71 +886,103 @@ def check_and_notify() -> tuple[int, int]:
             tool_id = item.get("_tool_id", "47")
 
             if item_id not in seen_ids:
-                # NEW LISTING FOUND! Send Telegram Alert!
-                logger.info(f"✨ NEW LISTING: {info['residence_name']} ({info['price']}€)")
+                # NEW LISTING FOUND!
+                mode_name = "Colocation" if info["is_coloc"] else "Individuel"
+                is_sniper_target = info["should_auto_apply"] and bool(apply_for_accommodation)
+                logger.info(f"✨ NEW LISTING: {info['residence_name']} ({info['price']}€) | Sniper Target: {is_sniper_target}")
                 listing_url = f"https://trouverunlogement.lescrous.fr/tools/{tool_id}/accommodations/{item_id}"
-
                 coloc_tag = " [Colocation]" if info["is_coloc"] else ""
+
+                # 1. SEND DIRECT LINK IMMEDIATELY so the user can apply manually without delay
+                logger.info(f"⚡ [IMMEDIATE ALERT] Sending listing #{item_id} link to Telegram first...")
                 alert_text = (
-                    "🏠 *NOUVELLE OFFRE CROUS MARSEILLE !*\n\n"
+                    "🚨 *NOUVELLE OFFRE CROUS TROUVÉE !*\n\n"
                     f"📍 *Résidence :* {info['residence_name']}\n"
                     f"🏷️ *Type :* {info['label']}{coloc_tag} ({info['surface']} m²)\n"
+                    f"👤 *Mode :* {mode_name}\n"
                     f"💶 *Loyer :* {info['price']} € / mois\n"
                     f"📬 *Adresse :* {info['address']}\n\n"
-                    "⚡ *Fais vite, clique ci-dessous pour réserver immédiatement !*"
+                    "⚡ *POSTULEZ IMMÉDIATEMENT :*\n"
+                    f"{listing_url}\n\n"
+                    + ("🤖 *Le sniper tente également l'auto-candidature en parallèle...*" if is_sniper_target
+                       else "ℹ️ *Alerte manuelle : réservation requise via le lien ci-dessus.*")
                 )
                 reply_markup = {
                     "inline_keyboard": [
-                        [{"text": "🚀 Ouvrir l'offre & Réserver", "url": listing_url}]
+                        [{"text": "⚡ Ouvrir l'offre & Postuler immédiatement", "url": listing_url}]
                     ]
                 }
+                send_telegram_message(alert_text, reply_markup=reply_markup)
 
-                if send_telegram_message(alert_text, reply_markup):
-                    seen_ids.add(item_id)
-                    new_alerts_sent += 1
-
-                # Trigger Automated Application (Sniper)
-                if AUTO_APPLY_ENABLED and apply_for_accommodation:
-                    logger.info(f"🤖 Triggering auto-apply for accommodation {item_id} (DRY_RUN={AUTO_APPLY_DRY_RUN})...")
+                # 2. AFTER SENDING, ATTEMPT THE SNIPE (if listing qualifies for auto-apply)
+                if is_sniper_target:
+                    target_mode = info.get("target_mode", "single")
+                    logger.info(f"⚡ [SNIPER AUTO-APPLY] Attempting auto-apply for {item_id} (mode={target_mode}, DRY_RUN={AUTO_APPLY_DRY_RUN})...")
                     try:
                         apply_res = apply_for_accommodation(
                             tool_id=tool_id,
                             accommodation_id=item_id,
+                            target_mode=target_mode,
                             dry_run=AUTO_APPLY_DRY_RUN
                         )
-                        if apply_res.get("success"):
-                            if AUTO_APPLY_DRY_RUN:
-                                caption = (
-                                    "🧪 *[DRY-RUN] Formulaire pré-rempli avec succès !*\n\n"
-                                    f"📍 *Résidence :* {info['residence_name']}\n"
-                                    f"⏱️ *Temps d'exécution :* {apply_res['duration_seconds']}s\n"
-                                    "ℹ️ *Mode DRY-RUN actif :* le bouton final n'a pas été cliqué."
-                                )
-                            else:
-                                caption = (
-                                    "🎯 *[RÉSERVATION AUTOMATIQUE RÉUSSIE]*\n\n"
-                                    f"📍 *Résidence :* {info['residence_name']}\n"
-                                    f"⏱️ *Snipé en :* {apply_res['duration_seconds']}s\n\n"
-                                    "🎉 Le logement a été placé dans votre panier !\n"
-                                    f"🔗 [Accéder à mon panier]({apply_res['cart_url']})"
-                                )
-                            if apply_res.get("screenshot_path"):
-                                send_telegram_photo(apply_res["screenshot_path"], caption)
-                            else:
-                                send_telegram_message(caption)
-                        else:
-                            err_msg = (
-                                "⚠️ *[ÉCHEC DE L'AUTO-APPLY]*\n\n"
-                                f"📍 *Résidence :* {info['residence_name']}\n"
-                                f"❌ *Erreur :* `{apply_res.get('error', 'Erreur inconnue')}`\n\n"
-                                f"⚡ Cliquez vite manuellement : {listing_url}"
-                            )
-                            if apply_res.get("screenshot_path"):
-                                send_telegram_photo(apply_res["screenshot_path"], err_msg)
-                            else:
-                                send_telegram_message(err_msg)
                     except Exception as apply_err:
                         logger.error(f"Error executing auto-apply: {apply_err}")
+                        apply_res = {"success": False, "error": str(apply_err)}
+
+                    if apply_res.get("success"):
+                        if AUTO_APPLY_DRY_RUN:
+                            caption = (
+                                "🧪 *[DRY-RUN - SNIPER ÉTAPE 2 VÉRIFIÉE]*\n\n"
+                                f"📍 *Résidence :* {info['residence_name']}\n"
+                                f"🏷️ *Type :* {info['label']}{coloc_tag} ({info['surface']} m²)\n"
+                                f"👤 *Mode choisi :* {mode_name}\n"
+                                f"💶 *Loyer :* {info['price']} € / mois\n"
+                                f"⏱️ *Temps d'exécution :* {apply_res['duration_seconds']}s\n"
+                                f"📬 *Adresse :* {info['address']}\n\n"
+                                "ℹ️ *Mode DRY-RUN :* Étape 2 (récapitulatif) atteinte avec succès ! Capture d'écran générée sans validation finale."
+                            )
+                        else:
+                            caption = (
+                                "🎯 *[RÉSERVATION SNIPÉE AVEC SUCCÈS !]*\n\n"
+                                f"📍 *Résidence :* {info['residence_name']}\n"
+                                f"🏷️ *Type :* {info['label']}{coloc_tag} ({info['surface']} m²)\n"
+                                f"👤 *Mode :* {mode_name}\n"
+                                f"💶 *Loyer :* {info['price']} € / mois\n"
+                                f"⏱️ *Snipé en :* {apply_res['duration_seconds']}s\n\n"
+                                "🎉 Demande envoyée au CROUS avec succès !\n"
+                                f"🔗 [Accéder à mon panier]({apply_res.get('cart_url', listing_url)})"
+                            )
+                        result_markup = {
+                            "inline_keyboard": [
+                                [{"text": "🚀 Ouvrir l'offre CROUS", "url": listing_url}]
+                            ]
+                        }
+                        if apply_res.get("screenshot_path"):
+                            send_telegram_photo(apply_res["screenshot_path"], caption, reply_markup=result_markup)
+                        else:
+                            send_telegram_message(caption, reply_markup=result_markup)
+                    else:
+                        err_msg = (
+                            "⚠️ *[RÉSULTAT DU SNIPER : ÉCHEC]*\n\n"
+                            f"📍 *Résidence :* {info['residence_name']}\n"
+                            f"🏷️ *Type :* {info['label']}{coloc_tag} ({info['surface']} m²)\n"
+                            f"💶 *Loyer :* {info['price']} € / mois\n"
+                            f"❌ *Raison :* `{apply_res.get('error', 'Erreur inconnue')}`\n\n"
+                            "⚡ *Poursuivez manuellement via le lien déjà envoyé :*\n"
+                            f"{listing_url}"
+                        )
+                        result_markup = {
+                            "inline_keyboard": [
+                                [{"text": "⚡ Réserver manuellement", "url": listing_url}]
+                            ]
+                        }
+                        if apply_res.get("screenshot_path"):
+                            send_telegram_photo(apply_res["screenshot_path"], err_msg, reply_markup=result_markup)
+                        else:
+                            send_telegram_message(err_msg, reply_markup=result_markup)
+
+                seen_ids.add(item_id)
+                new_alerts_sent += 1
 
     # Update state
     state["seen_ids"] = list(seen_ids)
@@ -762,27 +1022,52 @@ def main_loop():
 
     state = load_state()
     last_heartbeat_day = None
+    last_session_check = time.time()
 
     # Send startup announcement to Telegram
     is_logged_in, _ = is_session_valid()
     startup_msg = (
         "🚀 *CROUS Watcher Démarré sur votre VPS !*\n\n"
         f"🎯 *Ville :* {TARGET_CITY.capitalize()}\n"
-        f"💶 *Loyer Max :* {MAX_PRICE} €\n"
+        f"⚡ *Sniper < {AUTO_APPLY_ANY_MAX_PRICE:.0f} € :* Tout mode ({'🧪 DRY-RUN' if AUTO_APPLY_DRY_RUN else '⚡ LIVE'})\n"
+        f"🎯 *Sniper {AUTO_APPLY_ANY_MAX_PRICE:.0f}–{AUTO_APPLY_SINGLE_MAX_PRICE:.0f} € :* Individuel seul ({'🧪 DRY-RUN' if AUTO_APPLY_DRY_RUN else '⚡ LIVE'})\n"
+        f"📢 *Alerte Telegram seule :* Jusqu'à {MAX_PRICE:.0f} €\n"
         f"⏱️ *Cadence actuelle :* ~{cur_interval}s ({cur_cadence})\n"
-        f"🔐 *Session CROUS :* {'Active ✅' if is_logged_in else 'Non configurée ❌'}\n"
-        f"🤖 *Auto-Apply :* {'🧪 DRY-RUN' if AUTO_APPLY_DRY_RUN else '⚡ LIVE' if AUTO_APPLY_ENABLED else 'Désactivé'}\n\n"
+        f"🔐 *Session CROUS :* {'Active ✅' if is_logged_in else 'Non configurée / Expirée ❌'}\n\n"
         "Je surveille en continu 24h/24. Envoyez `/status` pour voir les métriques ou `/check` pour vérifier."
     )
     send_telegram_message(startup_msg)
 
     while RUNNING:
         is_blocked_error = False
-        try:
-            # 1. Check for incoming Telegram commands (/status, /check, /test, /session, /test_apply)
-            poll_telegram_updates(on_check_callback=check_and_notify)
 
-            # 2. Daily morning heartbeat (09:00 UTC)
+        # 1. Check for incoming Telegram commands (/status, /check, /test, /session, /renew, /test_apply, /pause, /resume)
+        poll_telegram_updates(on_check_callback=check_and_notify)
+
+        if PAUSED:
+            time.sleep(1)
+            continue
+
+        try:
+            # 2. Hourly background session check & auto-renewal
+            if time.time() - last_session_check > 3600:
+                last_session_check = time.time()
+                valid, s_msg = is_session_valid()
+                if not valid:
+                    logger.warning(f"Hourly check: session expired ({s_msg}). Attempting auto-renewal...")
+                    renewed, renew_msg = auto_login()
+                    if renewed:
+                        logger.info("Session successfully auto-renewed in background!")
+                        send_telegram_message("🔄 *Session CROUS renouvelée automatiquement.*")
+                    else:
+                        logger.error(f"Auto-renewal failed: {renew_msg}")
+                        send_telegram_message(
+                            f"⚠️ *Alerte Session CROUS Expirée*\n\n"
+                            f"Échec du renouvellement : `{renew_msg}`\n"
+                            "Utilisez `/renew` ou vérifiez vos identifiants dans `.env`."
+                        )
+
+            # 3. Daily morning heartbeat (09:00 UTC)
             now = datetime.now(timezone.utc)
             if ENABLE_DAILY_HEARTBEAT and now.hour == 9 and last_heartbeat_day != now.date():
                 last_heartbeat_day = now.date()
@@ -792,7 +1077,9 @@ def main_loop():
                     f"Offres actives en France : {METRICS['last_active_listings_count']}."
                 )
 
-            # 3. Run search check
+            # 4. Run search check (rotate to next proxy on every cycle)
+            if proxy_manager:
+                proxy_manager.rotate_proxy()
             check_and_notify()
 
         except CrousBlockedOrRateLimitedError as err:
@@ -801,9 +1088,29 @@ def main_loop():
             state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
             save_state(state)
             append_run_history("BLOCKED", str(err))
+            if activity_logger:
+                activity_logger.notify_general_error(
+                    f"Accès refusé ou limite atteinte (HTTP {err.code}) sur l'API CROUS",
+                    component_name="Scouter"
+                )
 
         except Exception as err:
-            logger.exception(f"Unexpected error in watcher cycle: {err}")
+            err_str = str(err)
+            if "111" in err_str or "connection refused" in err_str.lower():
+                is_blocked_error = True
+                logger.critical(f"Connection refused by CROUS firewall: {err}")
+                if activity_logger:
+                    activity_logger.notify_general_error(
+                        "Connexion refusée par le pare-feu CROUS (Erreur 111)",
+                        component_name="Scouter"
+                    )
+            else:
+                logger.exception(f"Unexpected error in watcher cycle: {err}")
+                if activity_logger:
+                    activity_logger.notify_general_error(
+                        f"Erreur inattendue dans le cycle : {err}",
+                        component_name="Watcher"
+                    )
             state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
             save_state(state)
             append_run_history("FAILURE", f"{err} | Consecutive: {state['consecutive_failures']}")
@@ -816,11 +1123,11 @@ def main_loop():
                     "Vérifiez les logs sur votre VPS (`journalctl -u crous-watcher`)."
                 )
 
-        # 4. Sleep cadence
+        # 5. Sleep cadence
         if is_blocked_error:
-            # Backoff for 5 minutes (300s) to allow rate limit to clear
-            logger.warning("Safety backoff activated: sleeping for 5 minutes...")
-            sleep_time = 300.0
+            # Backoff for 10 minutes (600s) to allow firewall block to clear
+            logger.warning("Safety backoff activated: sleeping for 10 minutes (600s)...")
+            sleep_time = 600.0
         else:
             cadence_seconds, cadence_label = get_smart_cadence()
             METRICS["current_cadence_mode"] = cadence_label

@@ -12,3 +12,11 @@ __pycache__/
 session.json
 screenshots/
 .vscode/
+
+proxies.txt
+.proxy_index
+.sniper_proxy_index
+.auth_proxy_index
+.chrome_cache/
+venv/
+*.tmp
