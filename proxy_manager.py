@@ -1,7 +1,10 @@
 import os
 import random
+import logging
 from pathlib import Path
 from urllib.parse import urlsplit, quote
+
+logger = logging.getLogger("proxy_manager")
 
 BASE_DIR = Path(__file__).resolve().parent
 PROXIES_FILE = BASE_DIR / "proxies.txt"
@@ -49,6 +52,9 @@ def load_proxies() -> list[str]:
 
 STATE_FILE = BASE_DIR / ".proxy_index"
 SNIPER_STATE_FILE = BASE_DIR / ".sniper_proxy_index"
+AUTH_STATE_FILE = BASE_DIR / ".auth_proxy_index"
+AUTH_EXCLUDED_MARKERS = ("oxylabs",)      # proxies whose URL contains any marker are never used for auth
+AUTH_PROXY_CHECK_TIMEOUT = 8              # seconds, per validation request
 
 
 def _get_stored_index() -> int:
@@ -81,6 +87,23 @@ def _save_sniper_stored_index(idx: int):
         SNIPER_STATE_FILE.write_text(str(idx))
     except Exception:
         pass
+
+
+def _get_auth_stored_index() -> int:
+    if AUTH_STATE_FILE.exists():
+        try:
+            return int(AUTH_STATE_FILE.read_text().strip())
+        except Exception:
+            pass
+    return 0
+
+
+def _save_auth_stored_index(idx: int):
+    try:
+        AUTH_STATE_FILE.write_text(str(idx))
+    except Exception:
+        pass
+
 
 
 def get_current_proxy(rotate: bool = False) -> str | None:
@@ -175,5 +198,68 @@ def get_playwright_proxy(proxy_url: str | None = None, rotate: bool = False) -> 
         import urllib.parse
         cfg["password"] = urllib.parse.unquote(u.password)
     return cfg
+
+
+def get_auth_proxy() -> dict | None:
+    """
+    Returns a dedicated, verified proxy for authentication with CROUS and MesServices.
+    Never uses excluded proxies (e.g. oxylabs), and ensures both finding housing and auth portals work.
+    """
+    proxies = load_proxies()
+    candidates = [p for p in proxies if not any(m in p.lower() for m in AUTH_EXCLUDED_MARKERS)]
+    if not candidates:
+        logger.warning("No candidate proxies available for auth (all excluded or list empty).")
+        return None
+
+    import urllib.request
+
+    start = _get_auth_stored_index() % len(candidates)
+
+    for i in range(len(candidates)):
+        idx = (start + i) % len(candidates)
+        p = candidates[idx]
+
+        u = urlsplit(p)
+        host = u.hostname or ""
+        port = str(u.port or "")
+        host_port = f"{host}:{port}" if port else host
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": p, "https": p}))
+
+        # Check 1: GET https://trouverunlogement.lescrous.fr/tools/47/search
+        try:
+            req1 = urllib.request.Request(
+                "https://trouverunlogement.lescrous.fr/tools/47/search",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with opener.open(req1, timeout=AUTH_PROXY_CHECK_TIMEOUT) as resp:
+                data = resp.read(256)
+                data_str = data.decode("utf-8", errors="ignore") if isinstance(data, (bytes, bytearray)) else str(data)
+                if resp.getcode() != 200 or "too many requests" in data_str.lower():
+                    raise ValueError(f"HTTP {resp.getcode()}")
+        except Exception as e:
+            logger.warning(f"Auth proxy candidate {host_port} failed check for trouverunlogement.lescrous.fr: {type(e).__name__}")
+            continue
+
+        # Check 2: GET https://messervices.etudiant.gouv.fr/
+        try:
+            req2 = urllib.request.Request(
+                "https://messervices.etudiant.gouv.fr/",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with opener.open(req2, timeout=AUTH_PROXY_CHECK_TIMEOUT) as resp:
+                if resp.getcode() != 200:
+                    raise ValueError(f"HTTP {resp.getcode()}")
+        except Exception as e:
+            logger.warning(f"Auth proxy candidate {host_port} failed check for messervices.etudiant.gouv.fr: {type(e).__name__}")
+            continue
+
+        _save_auth_stored_index((idx + 1) % len(candidates))
+        logger.info(f"Auth proxy selected: {host}:{port}")
+        return get_playwright_proxy(proxy_url=p)
+
+    logger.error("All candidate auth proxies failed validation.")
+    return None
+
 
 

@@ -29,6 +29,7 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSION_FILE = BASE_DIR / "session.json"
+AUTH_MAX_PROXY_ATTEMPTS = 3
 load_dotenv(BASE_DIR / ".env")
 
 logging.basicConfig(
@@ -70,40 +71,8 @@ def solve_altcha(challenge_data: dict) -> str:
     return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8")
 
 
-def auto_login(email: str = None, password: str = None) -> tuple[bool, str]:
-    """
-    Perform 100% headless automated login to MesServicesEtudiant using Altcha PoW solver.
-    Extracts new cookies and saves session.json atomically.
-    """
-    # Dynamically reload .env so live updates are recognized immediately
-    env_file = BASE_DIR / ".env"
-    if env_file.exists():
-        try:
-            from dotenv import load_dotenv
-            load_dotenv(env_file, override=True)
-        except Exception:
-            pass
-        if not os.getenv("CROUS_EMAIL") or not os.getenv("CROUS_PASSWORD"):
-            try:
-                with open(env_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#") and "=" in line:
-                            k, v = line.split("=", 1)
-                            os.environ[k.strip()] = v.strip()
-            except Exception:
-                pass
-
-    email = email or os.getenv("CROUS_EMAIL", "").strip()
-    password = password or os.getenv("CROUS_PASSWORD", "").strip()
-
-    if not email or not password:
-        return False, "CROUS_EMAIL ou CROUS_PASSWORD non configuré dans .env"
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return False, "Playwright n'est pas installé dans l'environnement Python."
+def _auto_login_attempt(email, password, pw_proxy) -> tuple[bool, str, bool]:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
     logger.info(f"Initiating headless automated login for: {email}")
 
@@ -118,16 +87,8 @@ def auto_login(email: str = None, password: str = None) -> tuple[bool, str]:
             ],
             "ignore_default_args": ["--enable-automation"]
         }
-        try:
-            import proxy_manager
-            pw_proxy = proxy_manager.get_sniper_proxy() if hasattr(proxy_manager, "get_sniper_proxy") else proxy_manager.get_playwright_proxy()
-        except ImportError:
-            pw_proxy = None
-
-        if pw_proxy:
+        if isinstance(pw_proxy, dict):
             launch_kwargs["proxy"] = pw_proxy
-        elif os.getenv("CROUS_PROXY"):
-            launch_kwargs["proxy"] = {"server": os.getenv("CROUS_PROXY")}
 
         browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
@@ -164,7 +125,7 @@ def auto_login(email: str = None, password: str = None) -> tuple[bool, str]:
             widget = page.locator("altcha-widget").first
             challenge_json_str = widget.get_attribute("challengejson")
             if not challenge_json_str:
-                return False, "Failed to retrieve Altcha challenge from login page."
+                return False, "Failed to retrieve Altcha challenge from login page.", True
 
             ch_data = json.loads(challenge_json_str)
             logger.info("Solving Altcha challenge mathematically...")
@@ -204,7 +165,7 @@ def auto_login(email: str = None, password: str = None) -> tuple[bool, str]:
             if "auth/sql/login" in page.url or "incorrects" in page_content or "identifiant ou mot de passe incorrect" in page_content:
                 screenshot_path = BASE_DIR / "screenshots" / "login_failed.png"
                 page.screenshot(path=str(screenshot_path))
-                return False, "Identifiant ou mot de passe CROUS incorrect."
+                return False, "Identifiant ou mot de passe CROUS incorrect.", False
 
             # Check if rules page is encountered
             if "/rules" in page.url:
@@ -222,9 +183,9 @@ def auto_login(email: str = None, password: str = None) -> tuple[bool, str]:
             valid, msg = is_session_valid()
             if valid:
                 logger.info("✅ Headless auto-login successful and verified!")
-                return True, "Authentification réussie. Session active."
+                return True, "Authentification réussie. Session active.", False
             else:
-                return False, f"Login submitted but verification returned: {msg}"
+                return False, f"Login submitted but verification returned: {msg}", False
 
         except Exception as e:
             logger.exception(f"Error during headless auto-login: {e}")
@@ -233,9 +194,68 @@ def auto_login(email: str = None, password: str = None) -> tuple[bool, str]:
                 page.screenshot(path=str(screenshot_path))
             except Exception:
                 pass
-            return False, f"Erreur lors de la connexion automatique: {e}"
+            is_retryable = ("net::ERR_" in str(e)) or isinstance(e, PlaywrightTimeoutError)
+            return False, f"Erreur lors de la connexion automatique: {e}", is_retryable
         finally:
             browser.close()
+
+
+def auto_login(email: str = None, password: str = None) -> tuple[bool, str]:
+    """
+    Perform 100% headless automated login to MesServicesEtudiant using Altcha PoW solver.
+    Extracts new cookies and saves session.json atomically.
+    """
+    # Dynamically reload .env so live updates are recognized immediately
+    env_file = BASE_DIR / ".env"
+    if env_file.exists():
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(env_file, override=True)
+        except Exception:
+            pass
+        if not os.getenv("CROUS_EMAIL") or not os.getenv("CROUS_PASSWORD"):
+            try:
+                with open(env_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            os.environ[k.strip()] = v.strip()
+            except Exception:
+                pass
+
+    email = email or os.getenv("CROUS_EMAIL", "").strip()
+    password = password or os.getenv("CROUS_PASSWORD", "").strip()
+
+    if not email or not password:
+        return False, "CROUS_EMAIL ou CROUS_PASSWORD non configuré dans .env"
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return False, "Playwright n'est pas installé dans l'environnement Python."
+
+    try:
+        import proxy_manager
+    except ImportError:
+        proxy_manager = None
+
+    attempts = 0
+    while proxy_manager is not None and attempts < AUTH_MAX_PROXY_ATTEMPTS:
+        pw_proxy = proxy_manager.get_auth_proxy()
+        if pw_proxy is None:
+            logger.warning("No validated auth proxy available.")
+            break
+        attempts += 1
+        logger.info(f"Auth login attempt {attempts}/{AUTH_MAX_PROXY_ATTEMPTS} via proxy {pw_proxy['server']}")
+        ok, msg, retryable = _auto_login_attempt(email, password, pw_proxy)
+        if ok or not retryable:
+            return ok, msg
+        logger.warning(f"Auth attempt {attempts} failed with a retryable error: {msg}")
+
+    logger.warning("Falling back to DIRECT (no proxy) connection for auth login.")
+    ok, msg, _ = _auto_login_attempt(email, password, None)
+    return ok, msg
 
 
 def get_auth_cookies() -> dict[str, str]:
