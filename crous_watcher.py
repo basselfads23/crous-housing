@@ -270,7 +270,7 @@ def poll_telegram_updates(on_check_callback=None):
 
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "crous-watcher"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=2) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             if not data.get("ok"):
                 return
@@ -1005,6 +1005,73 @@ def check_and_notify() -> tuple[int, int]:
 # Main Daemon Loop
 # ==============================================================================
 
+def wait_and_poll(total_seconds, poll_fn, poll_interval=3.0, clock=time.monotonic, sleep=time.sleep, keep_running=None):
+    if total_seconds <= 0:
+        return {
+            "elapsed": 0.0,
+            "polls": 0,
+            "poll_time": 0.0,
+            "slowest_poll": 0.0,
+        }
+
+    if keep_running is None:
+        keep_running = lambda: RUNNING
+
+    start = clock()
+    deadline = start + total_seconds
+    polls = 0
+    poll_time = 0.0
+    slowest_poll = 0.0
+    next_poll = 0.0
+
+    def _do_poll():
+        nonlocal polls, poll_time, slowest_poll, next_poll
+        t0 = clock()
+        try:
+            poll_fn()
+        except Exception as err:
+            logger.debug(f"wait_and_poll poll error: {err}")
+        t1 = clock()
+        duration = t1 - t0
+        polls += 1
+        poll_time += duration
+        if duration > slowest_poll:
+            slowest_poll = duration
+        next_poll = t1 + poll_interval
+
+    if not keep_running():
+        return {
+            "elapsed": float(clock() - start),
+            "polls": 0,
+            "poll_time": 0.0,
+            "slowest_poll": 0.0,
+        }
+
+    _do_poll()
+
+    while keep_running() and clock() < deadline:
+        now = clock()
+        if now >= next_poll:
+            _do_poll()
+            if not keep_running() or clock() >= deadline:
+                break
+            now = clock()
+
+        time_to_deadline = deadline - now
+        time_to_poll = next_poll - now
+        sleep_secs = min(0.5, time_to_deadline, time_to_poll)
+        if sleep_secs < 0.05:
+            sleep_secs = 0.05
+        sleep(sleep_secs)
+
+    return {
+        "elapsed": float(clock() - start),
+        "polls": polls,
+        "poll_time": float(poll_time),
+        "slowest_poll": float(slowest_poll),
+    }
+
+
 def main_loop():
     cur_interval, cur_cadence = get_smart_cadence()
     logger.info("==================================================")
@@ -1047,6 +1114,8 @@ def main_loop():
         if PAUSED:
             time.sleep(1)
             continue
+
+        work_start = time.monotonic()
 
         try:
             # 2. Hourly background session check & auto-renewal
@@ -1134,12 +1203,18 @@ def main_loop():
             jitter = random.uniform(-3.0, 5.0)
             sleep_time = max(15.0, cadence_seconds + jitter)
 
-        # Break sleep into 1-second chunks so incoming commands or signals are handled fast
-        for _ in range(int(sleep_time)):
-            if not RUNNING:
-                break
-            poll_telegram_updates(on_check_callback=check_and_notify)
-            time.sleep(1)
+        work = time.monotonic() - work_start
+        wait_res = wait_and_poll(sleep_time, lambda: poll_telegram_updates(on_check_callback=check_and_notify))
+        logger.info(
+            "Cycle timing: work=%.1fs planned_wait=%.1fs actual_wait=%.1fs polls=%d poll_time=%.1fs slowest_poll=%.1fs total=%.1fs",
+            work,
+            sleep_time,
+            wait_res["elapsed"],
+            wait_res["polls"],
+            wait_res["poll_time"],
+            wait_res["slowest_poll"],
+            work + wait_res["elapsed"],
+        )
 
     logger.info("CROUS Watcher Daemon stopped cleanly.")
     send_telegram_message("🛑 *CROUS Watcher arrêté sur le VPS.*")
