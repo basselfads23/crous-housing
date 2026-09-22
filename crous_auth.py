@@ -175,8 +175,12 @@ def _auto_login_attempt(email, password, pw_proxy) -> tuple[bool, str, bool]:
                     pass_btn.click()
                     page.wait_for_load_state("networkidle", timeout=10000)
 
-            # 7. Save authenticated session state
-            context.storage_state(path=str(SESSION_FILE))
+            # 7. Save authenticated session state atomically (write to temp file, then rename)
+            session_state = context.storage_state()
+            tmp_session_file = SESSION_FILE.with_suffix(".json.tmp")
+            with open(tmp_session_file, "w", encoding="utf-8") as f:
+                json.dump(session_state, f, indent=2)
+            os.replace(tmp_session_file, SESSION_FILE)
             logger.info(f"Session saved to {SESSION_FILE}")
 
             # 8. Verify with /api/health
