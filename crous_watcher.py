@@ -202,15 +202,24 @@ signal.signal(signal.SIGTERM, handle_shutdown)
 # Telegram API Helpers
 # ==============================================================================
 
-def send_telegram_message(text: str, reply_markup: dict = None) -> bool:
+def get_viewer_chat_ids() -> list[str]:
+    """Read TELEGRAM_VIEWER_CHAT_IDS from env: comma-separated chat IDs that receive broadcast-only alerts."""
+    raw = os.getenv("TELEGRAM_VIEWER_CHAT_IDS", "").strip()
+    if not raw:
+        return []
+    return [c.strip() for c in raw.split(",") if c.strip()]
+
+
+def send_telegram_message(text: str, reply_markup: dict = None, chat_id: str = None) -> bool:
     """Send a message to the configured Telegram chat."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not target:
         logger.warning("Telegram bot token or chat ID is missing. Skipping notification.")
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": target,
         "text": text,
         "parse_mode": "Markdown",
         "disable_web_page_preview": False
@@ -230,6 +239,18 @@ def send_telegram_message(text: str, reply_markup: dict = None) -> bool:
     except Exception as err:
         logger.error(f"Failed to send Telegram message: {err}")
         return False
+
+
+def broadcast_telegram_message(text: str, reply_markup: dict = None) -> bool:
+    """Send to the admin chat plus every configured viewer chat ID. Returns True if at least one send succeeded."""
+    recipients = []
+    seen = set()
+    for cid in [TELEGRAM_CHAT_ID] + get_viewer_chat_ids():
+        if cid and cid not in seen:
+            seen.add(cid)
+            recipients.append(cid)
+    results = [send_telegram_message(text, reply_markup=reply_markup, chat_id=cid) for cid in recipients]
+    return any(results)
 
 
 def send_telegram_photo(photo_path: str, caption: str = "") -> bool:
@@ -282,6 +303,10 @@ def poll_telegram_updates(on_check_callback=None):
                 msg = update.get("message", {})
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 text = (msg.get("text") or "").strip()
+
+                if text.lower() == "/whoami":
+                    send_telegram_message(f"Your Telegram chat ID is: `{chat_id}`", chat_id=chat_id)
+                    continue
 
                 # Security: only respond to the authorized user
                 if chat_id != TELEGRAM_CHAT_ID:
@@ -493,7 +518,7 @@ def send_test_notification():
             [{"text": "🚀 Ouvrir le portail CROUS", "url": "https://trouverunlogement.lescrous.fr"}]
         ]
     }
-    success = send_telegram_message(test_text, markup)
+    success = broadcast_telegram_message(test_text, markup)
     if success:
         logger.info("Test notification dispatched successfully.")
 
@@ -912,7 +937,7 @@ def check_and_notify() -> tuple[int, int]:
                         [{"text": "⚡ Ouvrir l'offre & Postuler immédiatement", "url": listing_url}]
                     ]
                 }
-                send_telegram_message(alert_text, reply_markup=reply_markup)
+                broadcast_telegram_message(alert_text, reply_markup=reply_markup)
 
                 # 2. AFTER SENDING, ATTEMPT THE SNIPE (if listing qualifies for auto-apply)
                 if is_sniper_target:
@@ -1103,7 +1128,7 @@ def main_loop():
         f"🔐 *Session CROUS :* {'Active ✅' if is_logged_in else 'Non configurée / Expirée ❌'}\n\n"
         "Je surveille en continu 24h/24. Envoyez `/status` pour voir les métriques ou `/check` pour vérifier."
     )
-    send_telegram_message(startup_msg)
+    broadcast_telegram_message(startup_msg)
 
     while RUNNING:
         is_blocked_error = False
