@@ -278,17 +278,21 @@ def get_auth_cookies() -> dict[str, str]:
         return {}
 
 
-def is_session_valid() -> tuple[bool, str]:
+def check_session_status() -> tuple[str, str]:
     """
-    Check if current session.json has an active authenticated session.
-    Queries https://trouverunlogement.lescrous.fr/api/health with the saved cookies.
+    Check current session.json validity against https://trouverunlogement.lescrous.fr/api/health.
+    Returns (status, message) where status is one of:
+      "valid"   - confirmed logged in
+      "invalid" - confirmed logged out / no session
+      "unknown" - could not determine (network/proxy failure after retries)
+    Does NOT mutate any shared proxy rotation state.
     """
     if not SESSION_FILE.exists():
-        return False, "No session.json found. Run 'python crous_auth.py --login' first."
+        return "invalid", "No session.json found. Run 'python crous_auth.py --login' first."
 
     cookies = get_auth_cookies()
     if not cookies:
-        return False, "session.json contains no cookies."
+        return "invalid", "session.json contains no cookies."
 
     cookie_header = "; ".join([f"{k}={v}" for k, v in cookies.items()])
     url = "https://trouverunlogement.lescrous.fr/api/health"
@@ -306,13 +310,20 @@ def is_session_valid() -> tuple[bool, str]:
     except ImportError:
         proxy_manager = None
 
-    for retry in range(3):
+    proxies_to_try = []
+    if proxy_manager:
         try:
-            if proxy_manager:
-                crous_proxy = proxy_manager.get_current_proxy(rotate=(retry > 0))
-            else:
-                crous_proxy = os.getenv("CROUS_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+            proxies_to_try = proxy_manager.load_proxies()
+        except Exception:
+            proxies_to_try = []
+    if not proxies_to_try:
+        env_proxy = os.getenv("CROUS_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+        proxies_to_try = [env_proxy] if env_proxy else [None]
 
+    last_error_msg = "Failed to verify session against CROUS API."
+    for retry in range(3):
+        crous_proxy = proxies_to_try[retry % len(proxies_to_try)]
+        try:
             handlers = []
             if crous_proxy:
                 handlers.append(urllib.request.ProxyHandler({"http": crous_proxy, "https": crous_proxy}))
@@ -321,20 +332,32 @@ def is_session_valid() -> tuple[bool, str]:
                 data = json.loads(resp.read().decode("utf-8"))
                 is_logged_in = data.get("isUserLoggedIn", False)
                 if is_logged_in:
-                    return True, "Session is ACTIVE and authenticated."
+                    return "valid", "Session is ACTIVE and authenticated."
                 else:
-                    return False, "Session has EXPIRED or user is not logged in."
+                    return "invalid", "Session has EXPIRED or user is not logged in."
         except urllib.error.HTTPError as err:
             if err.code == 429:
-                return True, "Session check rate-limited (HTTP 429), assumed active."
+                return "valid", "Session check rate-limited (HTTP 429), assumed active."
+            last_error_msg = f"Failed to verify session against CROUS API: {err}"
             if retry < 2:
                 continue
-            return False, f"Failed to verify session against CROUS API: {err}"
+            return "unknown", last_error_msg
         except Exception as err:
+            last_error_msg = f"Failed to verify session against CROUS API: {err}"
             if retry < 2:
                 continue
-            return False, f"Failed to verify session against CROUS API: {err}"
-    return False, "Failed to verify session against CROUS API."
+            return "unknown", last_error_msg
+    return "unknown", last_error_msg
+
+
+def is_session_valid() -> tuple[bool, str]:
+    """
+    Backward-compatible wrapper around check_session_status().
+    Preserves the exact (bool, str) contract used by existing callers:
+    "unknown" (could not verify) is still treated as False, same as before.
+    """
+    status, msg = check_session_status()
+    return (status == "valid"), msg
 
 
 def run_login_flow(timeout_seconds: int = 300) -> bool:
