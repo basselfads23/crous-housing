@@ -1114,7 +1114,6 @@ def main_loop():
 
     state = load_state()
     last_heartbeat_day = None
-    last_session_check = time.time()
 
     # Send startup announcement to Telegram
     is_logged_in, _ = is_session_valid()
@@ -1143,25 +1142,7 @@ def main_loop():
         work_start = time.monotonic()
 
         try:
-            # 2. Hourly background session check & auto-renewal
-            if time.time() - last_session_check > 3600:
-                last_session_check = time.time()
-                valid, s_msg = is_session_valid()
-                if not valid:
-                    logger.warning(f"Hourly check: session expired ({s_msg}). Attempting auto-renewal...")
-                    renewed, renew_msg = auto_login()
-                    if renewed:
-                        logger.info("Session successfully auto-renewed in background!")
-                        send_telegram_message("🔄 *Session CROUS renouvelée automatiquement.*")
-                    else:
-                        logger.error(f"Auto-renewal failed: {renew_msg}")
-                        send_telegram_message(
-                            f"⚠️ *Alerte Session CROUS Expirée*\n\n"
-                            f"Échec du renouvellement : `{renew_msg}`\n"
-                            "Utilisez `/renew` ou vérifiez vos identifiants dans `.env`."
-                        )
-
-            # 3. Daily morning heartbeat (09:00 UTC)
+            # 2. Daily morning heartbeat (09:00 UTC)
             now = datetime.now(timezone.utc)
             if ENABLE_DAILY_HEARTBEAT and now.hour == 9 and last_heartbeat_day != now.date():
                 last_heartbeat_day = now.date()
@@ -1171,7 +1152,7 @@ def main_loop():
                     f"Offres actives en France : {METRICS['last_active_listings_count']}."
                 )
 
-            # 4. Run search check (rotate to next proxy on every cycle)
+            # 3. Run search check (rotate to next proxy on every cycle)
             if proxy_manager:
                 proxy_manager.rotate_proxy()
             check_and_notify()
