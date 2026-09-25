@@ -78,25 +78,37 @@ of 2026-09-25):
   Price-in-cents parsing (the `>1000 -> divide by 100` heuristic) was also reviewed against this
   week's real listings (284.82€, 328.00€, etc. all came out exactly right) — looks correct in
   practice, not currently a live bug, downgraded from the original suspicion.
+- Tool-ID discovery hardening (commit a756348, live as of 2026-09-25 17:41 UTC restart):
+  discover_tool_ids() used to hit the CROUS homepage every single cycle with a single unretried
+  attempt, silently falling back to the hardcoded tool ID "47" on any failure with no alert. Now
+  cached for up to an hour, retries 3x with proxy rotation between attempts (matching
+  fetch_all_crous_listings' pattern), and on total failure reuses the last known-good tool ID list
+  instead of the hardcoded default — only falling back to "47" (loudly, via Telegram) if there's no
+  known-good list yet at all. Verified with verify_tool_id_discovery_fix.py, 5/5 pass.
+
+Scouter is now considered solid enough to move on from, per the plan to fully harden it before
+starting sniper work. Remaining scouter items (night/day throttling, seen_ids cleanup) are
+low-priority polish, not correctness risks — see below.
 
 STILL OPEN, IN PRIORITY ORDER:
 1. TASK 2 below — push to origin. Pure data-loss risk.
-2. Watch the scouter fixes run a full day+, especially whether the second Webshare account
+2. crous_apply.py audit — nobody has reviewed this file. Do this before ever enabling live
+   (non-dry-run) auto-apply. NEXT UP.
+3. Sniper proxy logic — separately scoped, not yet audited.
+4. Sniper precision — once crous_apply.py is audited, the sniper's own auto-apply trigger logic
+   (is_target_listing's should_auto_apply / dual-tier price thresholds) needs its own pass so it
+   only fires on genuinely great deals (e.g. a 250€ T1 at 14m², not just anything under the tier
+   cutoffs). Explicitly deferred until the scouter + apply logic are both trusted — not started.
+5. Watch the scouter fixes run a full day+, especially whether the second Webshare account
    ("kurosaki ichigo" / pismgcox) eventually hits its own 402.
-3. crous_apply.py audit — nobody has reviewed this file. Do this before ever enabling live
-   (non-dry-run) auto-apply.
-4. Sniper proxy logic — separately scoped, not yet audited.
-5. Sniper precision — once the scouter's matching is trusted, the sniper's own auto-apply
-   trigger logic (is_target_listing's should_auto_apply / dual-tier price thresholds) needs its
-   own pass so it only fires on genuinely great deals (e.g. a 250€ T1 at 14m², not just anything
-   under the tier cutoffs). Explicitly deferred until the scouter is solid — not started.
 6. Night/day request throttling — proposed, never built. Needs real activity-logging data FIRST
    (timestamp + day-of-week per listing seen) before changing cadence — "no listings at night/on
    Sundays" is currently an assumption. THROTTLE ONLY, never a hard stop, until weeks of data say
    otherwise (a missed rare listing costs more than the bandwidth saved). Do NOT touch Saturday —
    French government services can be open Saturdays.
-7. Cleanup: verify_proxy_group_fix.py, verify_fetch_listings_e2e.py, verify_city_match_fix.py,
-   proxies.txt.bak-2026-09-25 are recent test/backup artifacts — move to tests/ or delete once no
+7. Cleanup: seen_ids in listings_seen.json grows forever, never trimmed — low priority. Also move
+   verify_proxy_group_fix.py, verify_fetch_listings_e2e.py, verify_city_match_fix.py,
+   verify_tool_id_discovery_fix.py, proxies.txt.bak-2026-09-25 to tests/ or delete once no
    longer needed.
 8. Webshare proxies are on a 1GB bandwidth cap and are expected to hit it within a couple of days
    at current usage. Decision to buy more proxies was deliberately deferred pending ~a day of
