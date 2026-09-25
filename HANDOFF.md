@@ -109,34 +109,77 @@ low-priority polish, not correctness risks — see below.
   account. Needs a deliberate, watched live test (checking the real CROUS account afterward), not
   something to assume either way. Do this before trusting DRY-RUN's safety further, and definitely
   before ever flipping AUTO_APPLY_DRY_RUN off.
-  ALSO OUT OF SCOPE (deliberately, per the three-proxy-systems isolation rule): get_sniper_proxy()'s
-  own internal selection/health-check logic in proxy_manager.py — only its return shape was checked
-  (to confirm proxy credentials never reach sniper.log, which they don't — verified). Its actual
-  selection behavior is still TASK 3 below, unaudited.
+  Its return shape was checked to confirm proxy credentials never reach sniper.log (they don't —
+  verified) — full audit of its own selection behavior happened next, see below.
+
+- Sniper proxy logic audited and fixed (commit 9736b3f, live as of 2026-09-25 19:58 UTC restart):
+  get_sniper_proxy() and rotate_sniper_proxy() indexed into two DIFFERENT proxy orderings
+  (Webshare-first candidate order vs. raw load_proxies() file order) while sharing the same stored
+  index file — after a 429 triggered rotate_sniper_proxy(), the next pick could land on an
+  essentially arbitrary proxy, including possibly the one that just got rate-limited. Fixed via a
+  shared _sniper_candidate_list() ordering used by both functions. Verified with
+  verify_sniper_proxy_index_fix.py, 2/2 pass, fully mocked — zero live proxy calls/bandwidth spent.
+  Oxylabs proxies remain deprioritized-not-excluded here, confirmed consistent with the handoff
+  (the known Oxylabs 403 is against the login/OAuth host, not this one).
+
+- Sniper precision tuning (commit 7277995, live as of 2026-09-25 19:58 UTC restart): replaced the
+  old flat dual-tier logic (rent < 300€ any mode, 300–350€ single only) with price/surface tiers,
+  individual-only (colocation is now NEVER auto-applied, always alert-only), anchored on real
+  listings from 2026-09-25:
+    rent < 250€            -> snipe, any surface
+    250€ <= rent <= 300€   -> snipe only if surface is 12–19 m² (inclusive)
+    300€ <  rent <= 350€   -> snipe only if surface > 19 m²
+  Fails safe (no auto-apply) if surface data is missing. New env vars: AUTO_APPLY_CHEAP_MAX_PRICE
+  (250), AUTO_APPLY_MID_MAX_PRICE (300), AUTO_APPLY_MID_MIN/MAX_SURFACE_M2 (12/19).
+  AUTO_APPLY_ANY_MAX_PRICE retired (no longer meaningful). .env updated to match. Verified with
+  verify_sniper_tier_logic.py, 21/21 pass, including the real anchor listings.
+  Also investigated (per explicit question): does the code correctly handle listings with two
+  different prices depending on occupation mode? Yes, confirmed against live API data —
+  occupationModes is parsed per-mode already, not flattened. Found a third occupation type CROUS
+  uses, "couple" (alongside "alone"/"house_sharing") — correctly excluded from the auto-apply
+  decision, though a listing that ONLY offered "couple" pricing could show a mislabeled price in
+  the manual Telegram alert (zero real occurrences found in a full nationwide scan; noted,
+  deliberately not fixed).
+  Also added: record_marseille_listing() — every new Marseille listing (individual AND colocation)
+  now gets appended to marseille_listings_data.jsonl (price(s), surface, room type, mode,
+  coordinates, link, timestamp) for future tier tuning against real data. Verified with
+  verify_listings_data_recording.py, 18/18 pass.
+
+- Weekend bandwidth-conservation pause (commit 7277995 + 55463af, live as of 2026-09-25 19:58 UTC
+  restart, confirmed 0 automatic check cycles since restart): ONE-TIME, time-boxed full stop of
+  automatic polling — paused now through Saturday 06:00 Paris time, active Saturday 06:00–14:00,
+  paused again through Monday 06:00, back to normal after that with nothing to remove (self-
+  expiring date-anchored windows, not a recurring rule). Telegram commands stay live throughout.
+  Distinct from the permanent night/day throttling feature below (still not built). Verified with
+  verify_weekend_pause_window.py, 12/12 pass.
 
 STILL OPEN, IN PRIORITY ORDER:
-1. TASK 2 below — push to origin. Pure data-loss risk.
-2. Resolve the crous_apply.py dry-run open question above — live, watched test needed.
-3. Sniper proxy logic (get_sniper_proxy() in proxy_manager.py) — separately scoped, not yet audited.
-4. Sniper precision — the sniper's own auto-apply trigger logic (is_target_listing's
-   should_auto_apply / dual-tier price thresholds) needs its own pass so it only fires on genuinely
-   great deals (e.g. a 250€ T1 at 14m², not just anything under the tier cutoffs). Explicitly
-   deferred until the scouter + apply logic are both trusted — not started.
-5. Watch the scouter fixes run a full day+, especially whether the second Webshare account
-   ("kurosaki ichigo" / pismgcox) eventually hits its own 402.
-6. Night/day request throttling — proposed, never built. Needs real activity-logging data FIRST
-   (timestamp + day-of-week per listing seen) before changing cadence — "no listings at night/on
-   Sundays" is currently an assumption. THROTTLE ONLY, never a hard stop, until weeks of data say
-   otherwise (a missed rare listing costs more than the bandwidth saved). Do NOT touch Saturday —
-   French government services can be open Saturdays.
-7. Cleanup: seen_ids in listings_seen.json grows forever, never trimmed — low priority. Also move
+1. TASK 2 below — push to origin. Pure data-loss risk. 20 commits local, unpushed.
+2. Resolve the crous_apply.py dry-run open question (see above) — live, watched test needed before
+   trusting DRY-RUN further or ever flipping AUTO_APPLY_DRY_RUN off.
+3. AUTO_APPLY_ENABLED is still false in .env — sniper won't fire at all (independent of DRY_RUN)
+   until this is manually flipped true. Deliberately left as a manual decision, not automated.
+4. Watch the scouter fixes run a full day+, especially whether the second Webshare account
+   ("kurosaki ichigo" / pismgcox) eventually hits its own 402. Note: watching is paused along with
+   everything else during the weekend pause window above.
+5. Night/day request throttling (the PERMANENT version) — proposed, never built. Needs real
+   activity-logging data FIRST (timestamp + day-of-week per listing seen) before changing cadence —
+   "no listings at night/on Sundays" is currently an assumption. THROTTLE ONLY, never a hard stop,
+   until weeks of data say otherwise. Do NOT touch Saturday — French government services can be
+   open Saturdays. (The weekend pause above is a separate, deliberate, temporary exception to this
+   principle, justified by the concrete Webshare bandwidth constraint — not a policy change.)
+6. Cleanup: seen_ids in listings_seen.json grows forever, never trimmed — low priority. Also move
    verify_proxy_group_fix.py, verify_fetch_listings_e2e.py, verify_city_match_fix.py,
-   verify_tool_id_discovery_fix.py, verify_apply_mode_selection_fix.py, proxies.txt.bak-2026-09-25
-   to tests/ or delete once no longer needed.
-8. Webshare proxies are on a 1GB bandwidth cap and are expected to hit it within a couple of days
-   at current usage. Decision to buy more proxies was deliberately deferred pending ~a day of
-   testing to confirm Webshare's datacenter IPs hold up against messervices.etudiant.gouv.fr
-   (they do, per this handoff's proxies.txt notes) — revisit buying once they actually run dry.
+   verify_tool_id_discovery_fix.py, verify_apply_mode_selection_fix.py, verify_sniper_tier_logic.py,
+   verify_sniper_proxy_index_fix.py, verify_weekend_pause_window.py,
+   verify_listings_data_recording.py, proxies.txt.bak-2026-09-25 to tests/ or delete once no longer
+   needed.
+7. Webshare proxies are on a 1GB bandwidth cap. Decision to buy more proxies was deliberately
+   deferred pending ~a day of testing to confirm Webshare's datacenter IPs hold up against
+   messervices.etudiant.gouv.fr (they do, per this handoff's proxies.txt notes) — revisit Monday,
+   partly informed by whatever marseille_listings_data.jsonl has collected by then.
+8. The "couple" occupation-type mislabeling edge case noted above — low priority, zero observed
+   occurrences.
 
 ## TASK 1 (DO FIRST): Audit session_keeper.py — READ-ONLY
 
