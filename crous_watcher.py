@@ -89,17 +89,36 @@ AUTO_APPLY_SINGLE_MAX_PRICE = float(os.getenv("AUTO_APPLY_SINGLE_MAX_PRICE", "35
 # Proxy manager integration
 try:
     import proxy_manager
+    from proxy_manager import AllProxyGroupsExhaustedError
 except ImportError:
     proxy_manager = None
+    class AllProxyGroupsExhaustedError(Exception):
+        """Raised when all configured proxy groups are exhausted (e.g. 402 Payment Required)."""
+        pass
 
 try:
     import activity_logger
 except ImportError:
     activity_logger = None
 
+
+def is_payment_required_error(err: Exception) -> bool:
+    """Check if exception is an HTTP 402 Payment Required or tunnel CONNECT 402."""
+    if isinstance(err, urllib.error.HTTPError) and err.code == 402:
+        return True
+    err_str = str(err).lower()
+    if "402" in err_str and ("payment required" in err_str or "tunnel" in err_str):
+        return True
+    if "payment required" in err_str:
+        return True
+    return False
+
+
 def get_crous_opener_and_proxy(rotate: bool = False):
     handlers = []
     proxy_url = proxy_manager.get_current_proxy(rotate=rotate) if proxy_manager else (os.getenv("CROUS_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY"))
+    if proxy_manager and proxy_manager.load_proxies() and not proxy_url:
+        raise AllProxyGroupsExhaustedError("All proxy groups are exhausted (no available proxies)")
     if proxy_url:
         handlers.append(urllib.request.ProxyHandler({
             "http": proxy_url,
@@ -375,8 +394,11 @@ def handle_telegram_command(cmd: str, on_check_callback=None):
         is_logged_in, session_msg = is_session_valid()
 
         total_proxies = len(proxy_manager.load_proxies()) if proxy_manager else 0
-        current_proxy = proxy_manager.get_current_proxy() if proxy_manager else "Aucun"
-        proxy_display = current_proxy.split("@")[-1] if (current_proxy and "@" in current_proxy) else current_proxy
+        current_proxy = proxy_manager.get_current_proxy() if proxy_manager else None
+        if not current_proxy:
+            proxy_display = "Aucun (Tous les groupes sont épuisés ⚠️)" if total_proxies > 0 else "Aucun"
+        else:
+            proxy_display = current_proxy.split("@")[-1] if "@" in current_proxy else current_proxy
 
         header_icon = "⏸️" if PAUSED else "🟢"
         header_text = "CROUS Watcher en PAUSE (Tapez /resume)" if PAUSED else "CROUS Watcher Actif (24/7)"
@@ -602,6 +624,8 @@ def discover_tool_ids() -> list[str]:
             found = set(re.findall(r"/tools/(\d+)", html))
             if found:
                 return sorted(list(found))
+    except AllProxyGroupsExhaustedError:
+        raise
     except Exception as err:
         if activity_logger:
             activity_logger.log_scouter_attempt(
@@ -646,13 +670,53 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
         data = None
         last_error = None
         for attempt in range(max_proxy_retries):
-            opener, proxy_url = get_crous_opener_and_proxy(rotate=(attempt > 0))
+            opener, proxy_url = get_crous_opener_and_proxy(rotate=False)
             try:
                 with opener.open(req, timeout=12) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     break
             except urllib.error.HTTPError as http_err:
                 last_error = http_err
+                if is_payment_required_error(http_err):
+                    group = proxy_manager.get_proxy_group(proxy_url) if proxy_manager else "unknown"
+                    is_new = proxy_manager.mark_group_exhausted(group, reason=f"HTTP 402 ({http_err.reason})") if proxy_manager else False
+                    if is_new:
+                        send_telegram_message(
+                            f"⚠️ *[Alerte Proxy - Fournisseur Épuisé]*\n\n"
+                            f"• *Groupe :* `{group}`\n"
+                            f"• *Raison :* `HTTP {http_err.code} ({http_err.reason})`\n"
+                            f"• *Action :* Basculement automatique sur les fournisseurs restants."
+                        )
+                    remaining = proxy_manager.get_available_groups() if proxy_manager else []
+                    if len(remaining) == 1:
+                        logger.warning(f"Scouter operating with only ONE healthy proxy group remaining: {remaining[0]}")
+                    if not remaining:
+                        if activity_logger:
+                            activity_logger.log_scouter_attempt(
+                                proxy_url,
+                                url,
+                                success=False,
+                                error_message="Tous les groupes de proxys sont épuisés (402 Payment Required)",
+                                next_run=get_next_run_estimate()
+                            )
+                        raise AllProxyGroupsExhaustedError("All proxy groups are exhausted (402 Payment Required)")
+
+                    retry_str = "Retrying with next proxy..." if (attempt < max_proxy_retries - 1) else get_next_run_estimate()
+                    if activity_logger:
+                        activity_logger.log_scouter_attempt(
+                            proxy_url,
+                            url,
+                            success=False,
+                            error_message=None,
+                            next_run=retry_str
+                        )
+                    if attempt < max_proxy_retries - 1 and proxy_manager:
+                        logger.warning(f"Proxy group '{group}' exhausted (402). Rotating to remaining groups...")
+                        proxy_manager.rotate_proxy(skip_exhausted=True)
+                        continue
+                    else:
+                        raise
+
                 retry_str = "Retrying with next proxy..." if (attempt < max_proxy_retries - 1) else get_next_run_estimate()
                 if activity_logger:
                     activity_logger.log_scouter_attempt(
@@ -665,7 +729,7 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
                 if http_err.code in (403, 429):
                     if attempt < max_proxy_retries - 1 and proxy_manager:
                         logger.warning(f"HTTP {http_err.code} on current proxy. Rotating to next proxy...")
-                        proxy_manager.rotate_proxy()
+                        proxy_manager.rotate_proxy(skip_exhausted=True)
                         continue
                     raise CrousBlockedOrRateLimitedError(
                         http_err.code,
@@ -673,9 +737,49 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
                     )
                 if attempt < max_proxy_retries - 1 and proxy_manager:
                     logger.warning(f"HTTP {http_err.code} on proxy. Rotating proxy and retrying...")
-                    proxy_manager.rotate_proxy()
+                    proxy_manager.rotate_proxy(skip_exhausted=True)
             except Exception as err:
                 last_error = err
+                if is_payment_required_error(err):
+                    group = proxy_manager.get_proxy_group(proxy_url) if proxy_manager else "unknown"
+                    is_new = proxy_manager.mark_group_exhausted(group, reason="402 Payment Required") if proxy_manager else False
+                    if is_new:
+                        send_telegram_message(
+                            f"⚠️ *[Alerte Proxy - Fournisseur Épuisé]*\n\n"
+                            f"• *Groupe :* `{group}`\n"
+                            f"• *Raison :* `HTTP 402 Payment Required`\n"
+                            f"• *Action :* Basculement automatique sur les fournisseurs restants."
+                        )
+                    remaining = proxy_manager.get_available_groups() if proxy_manager else []
+                    if len(remaining) == 1:
+                        logger.warning(f"Scouter operating with only ONE healthy proxy group remaining: {remaining[0]}")
+                    if not remaining:
+                        if activity_logger:
+                            activity_logger.log_scouter_attempt(
+                                proxy_url,
+                                url,
+                                success=False,
+                                error_message="Tous les groupes de proxys sont épuisés (402 Payment Required)",
+                                next_run=get_next_run_estimate()
+                            )
+                        raise AllProxyGroupsExhaustedError("All proxy groups are exhausted (402 Payment Required)")
+
+                    retry_str = "Retrying with next proxy..." if (attempt < max_proxy_retries - 1) else get_next_run_estimate()
+                    if activity_logger:
+                        activity_logger.log_scouter_attempt(
+                            proxy_url,
+                            url,
+                            success=False,
+                            error_message=None,
+                            next_run=retry_str
+                        )
+                    if attempt < max_proxy_retries - 1 and proxy_manager:
+                        logger.warning(f"Proxy group '{group}' exhausted (402). Rotating to remaining groups...")
+                        proxy_manager.rotate_proxy(skip_exhausted=True)
+                        continue
+                    else:
+                        raise
+
                 retry_str = "Retrying with next proxy..." if (attempt < max_proxy_retries - 1) else get_next_run_estimate()
                 if activity_logger:
                     activity_logger.log_scouter_attempt(
@@ -687,7 +791,7 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
                     )
                 if attempt < max_proxy_retries - 1 and proxy_manager:
                     logger.warning(f"Network issue on proxy: {err}. Rotating to next proxy...")
-                    proxy_manager.rotate_proxy()
+                    proxy_manager.rotate_proxy(skip_exhausted=True)
                 else:
                     err_str = str(err)
                     if "111" in err_str or "connection refused" in err_str.lower():
@@ -862,6 +966,13 @@ def check_and_notify() -> tuple[int, int]:
     state = load_state()
     seen_ids = set(str(i) for i in state.get("seen_ids", []))
 
+    if proxy_manager:
+        available_groups = proxy_manager.get_available_groups()
+        if len(available_groups) == 1:
+            logger.warning(
+                f"Scouter operating with only ONE healthy proxy group remaining: {available_groups[0]}"
+            )
+
     tool_ids = discover_tool_ids()
     # Natural delay between homepage check and search requests (random 2 to 3 seconds)
     time.sleep(random.uniform(2.0, 3.0))
@@ -877,6 +988,8 @@ def check_and_notify() -> tuple[int, int]:
             for it in items:
                 it["_tool_id"] = tid
             all_raw_items.extend(items)
+        except AllProxyGroupsExhaustedError:
+            raise
         except CrousBlockedOrRateLimitedError as err:
             logger.critical(f"CRITICAL API RESTRICTION: {err}")
             send_telegram_message(
@@ -1154,8 +1267,25 @@ def main_loop():
 
             # 3. Run search check (rotate to next proxy on every cycle)
             if proxy_manager:
-                proxy_manager.rotate_proxy()
+                proxy_manager.rotate_proxy(skip_exhausted=True)
             check_and_notify()
+
+        except AllProxyGroupsExhaustedError as err:
+            logger.critical(f"ALL PROXY GROUPS EXHAUSTED: {err}")
+            state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+            save_state(state)
+            append_run_history("EXHAUSTED", f"{err} | Consecutive: {state['consecutive_failures']}")
+            if activity_logger:
+                activity_logger.notify_general_error(
+                    "Tous les groupes de proxys sont épuisés (402 Payment Required). Aucun proxy sain disponible.",
+                    component_name="Scouter"
+                )
+            if state["consecutive_failures"] == 5:
+                send_telegram_message(
+                    f"🚨 *Alerte Watcher : 5 échecs consécutifs*\n\n"
+                    f"Dernière erreur : `Tous les groupes de proxys sont épuisés (402)`\n"
+                    "Vérifiez vos comptes de proxys sur votre VPS."
+                )
 
         except CrousBlockedOrRateLimitedError as err:
             is_blocked_error = True

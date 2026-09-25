@@ -1,13 +1,25 @@
 import os
+import time
+import json
 import random
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, quote
 
 logger = logging.getLogger("proxy_manager")
 
+
+class AllProxyGroupsExhaustedError(Exception):
+    """Raised when all configured proxy groups are exhausted (e.g. 402 Payment Required)."""
+    pass
+
+
 BASE_DIR = Path(__file__).resolve().parent
 PROXIES_FILE = BASE_DIR / "proxies.txt"
+EXHAUSTED_GROUPS_FILE = BASE_DIR / ".exhausted_proxy_groups.json"
+EXHAUSTION_TTL_SECONDS = 24 * 3600  # 24 hours
+
 
 _CURRENT_INDEX = 0
 
@@ -106,21 +118,126 @@ def _save_auth_stored_index(idx: int):
 
 
 
-def get_current_proxy(rotate: bool = False) -> str | None:
-    """Get current active proxy URL, optionally rotating to next proxy in the list."""
+def get_proxy_group(proxy_url: str) -> str:
+    """
+    Extract provider account username from proxy URL to group proxies.
+    Falls back to hostname or 'direct'.
+    """
+    if not proxy_url:
+        return "direct"
+    u = urlsplit(proxy_url)
+    if u.username:
+        import urllib.parse
+        return urllib.parse.unquote(u.username)
+    return u.hostname or "direct"
+
+
+def get_exhausted_groups() -> dict[str, dict]:
+    """
+    Read .exhausted_proxy_groups.json, evict entries older than 24h TTL,
+    and return dict of currently exhausted groups.
+    Manual recovery: delete .exhausted_proxy_groups.json by hand (rm .exhausted_proxy_groups.json).
+    """
+    if not EXHAUSTED_GROUPS_FILE.exists():
+        return {}
+    try:
+        content = EXHAUSTED_GROUPS_FILE.read_text(encoding="utf-8").strip()
+        if not content:
+            return {}
+        data = json.loads(content)
+        if not isinstance(data, dict):
+            return {}
+        now = time.time()
+        active = {}
+        changed = False
+        for group, info in data.items():
+            if isinstance(info, dict):
+                exhausted_at = info.get("exhausted_at", 0)
+                if (now - exhausted_at) < EXHAUSTION_TTL_SECONDS:
+                    active[group] = info
+                else:
+                    changed = True
+            else:
+                changed = True
+        if changed:
+            try:
+                EXHAUSTED_GROUPS_FILE.write_text(json.dumps(active, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        return active
+    except Exception as e:
+        logger.warning(f"Failed to read exhausted proxy groups: {e}")
+        return {}
+
+
+def get_available_groups() -> list[str]:
+    """Return distinct proxy groups loaded from proxies.txt that are not currently exhausted."""
+    proxies = load_proxies()
+    if not proxies:
+        return []
+    exhausted = get_exhausted_groups()
+    all_groups = []
+    seen = set()
+    for p in proxies:
+        g = get_proxy_group(p)
+        if g not in seen:
+            seen.add(g)
+            all_groups.append(g)
+    return [g for g in all_groups if g not in exhausted]
+
+
+def mark_group_exhausted(group: str, reason: str = "402 Payment Required") -> bool:
+    """
+    Mark an entire proxy group as exhausted, persisting to .exhausted_proxy_groups.json.
+    Returns True if this is a new transition (first time group is marked exhausted),
+    or False if it was already marked exhausted.
+    """
+    if not group:
+        return False
+    current = get_exhausted_groups()
+    is_new = group not in current
+    now = time.time()
+    iso = datetime.now(timezone.utc).isoformat()
+    current[group] = {
+        "exhausted_at": now,
+        "iso": iso,
+        "reason": reason
+    }
+    try:
+        EXHAUSTED_GROUPS_FILE.write_text(json.dumps(current, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"Failed to write {EXHAUSTED_GROUPS_FILE}: {e}")
+    return is_new
+
+
+def get_current_proxy(rotate: bool = False, skip_exhausted: bool = True) -> str | None:
+    """
+    Get current active proxy URL, optionally rotating to next proxy in the list.
+    When skip_exhausted=True, proxies belonging to exhausted groups are excluded.
+    """
     proxies = load_proxies()
     if not proxies:
         return None
+
+    if skip_exhausted:
+        exhausted = get_exhausted_groups()
+        candidates = [p for p in proxies if get_proxy_group(p) not in exhausted]
+    else:
+        candidates = proxies
+
+    if not candidates:
+        return None
+
     idx = _get_stored_index()
     if rotate:
-        idx = (idx + 1) % len(proxies)
+        idx = (idx + 1) % 1_000_000
         _save_stored_index(idx)
-    return proxies[idx % len(proxies)]
+    return candidates[idx % len(candidates)]
 
 
-def rotate_proxy() -> str | None:
+def rotate_proxy(skip_exhausted: bool = True) -> str | None:
     """Rotate to the next proxy in the list and return it."""
-    return get_current_proxy(rotate=True)
+    return get_current_proxy(rotate=True, skip_exhausted=skip_exhausted)
 
 
 def rotate_sniper_proxy() -> dict | None:
