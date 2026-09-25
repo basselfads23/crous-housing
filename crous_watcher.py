@@ -33,6 +33,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "listings_seen.json"
 HISTORY_LOG_FILE = BASE_DIR / "run_history.log"
 LOG_FILE = BASE_DIR / "watcher.log"
+LISTINGS_DATA_FILE = BASE_DIR / "marseille_listings_data.jsonl"
 
 # Fix Windows console UTF-8 output
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -83,10 +84,36 @@ EVENING_CHECK_INTERVAL_SECONDS = int(os.getenv("EVENING_CHECK_INTERVAL_SECONDS",
 NIGHT_CHECK_INTERVAL_SECONDS = int(os.getenv("NIGHT_CHECK_INTERVAL_SECONDS", "240"))
 
 # Automated Application (Sniper) Configuration
+# Individual-only, price/surface tiered (colocation is never auto-applied, always
+# alert-only). Anchored on real Marseille listings from 2026-09-25: a 255e/12m2 and
+# a 284.82e/19m2 T1 were both judged "snipe immediately" deals, while a 350e/14m2
+# room was judged "not a good enough deal at that size" and deliberately excluded.
 AUTO_APPLY_ENABLED = os.getenv("AUTO_APPLY_ENABLED", "true").lower() in ("true", "1", "yes")
 AUTO_APPLY_DRY_RUN = os.getenv("AUTO_APPLY_DRY_RUN", "true").lower() in ("true", "1", "yes")
-AUTO_APPLY_ANY_MAX_PRICE = float(os.getenv("AUTO_APPLY_ANY_MAX_PRICE", "300"))
+AUTO_APPLY_CHEAP_MAX_PRICE = float(os.getenv("AUTO_APPLY_CHEAP_MAX_PRICE", "250"))
+AUTO_APPLY_MID_MAX_PRICE = float(os.getenv("AUTO_APPLY_MID_MAX_PRICE", "300"))
 AUTO_APPLY_SINGLE_MAX_PRICE = float(os.getenv("AUTO_APPLY_SINGLE_MAX_PRICE", "350"))
+AUTO_APPLY_MID_MIN_SURFACE_M2 = float(os.getenv("AUTO_APPLY_MID_MIN_SURFACE_M2", "12"))
+AUTO_APPLY_MID_MAX_SURFACE_M2 = float(os.getenv("AUTO_APPLY_MID_MAX_SURFACE_M2", "19"))
+
+
+def _format_sniper_rules_text() -> str:
+    """
+    One shared description of the current auto-apply price/surface tiers, used in
+    the /help, /status, and startup Telegram messages so they can't drift out of
+    sync with each other or with the actual trigger logic in is_target_listing().
+    """
+    mode_tag = "🧪 DRY-RUN" if AUTO_APPLY_DRY_RUN else "⚡ LIVE"
+    return (
+        f"⚡ *Sniper < {AUTO_APPLY_CHEAP_MAX_PRICE:.0f} € :* Individuel, toute surface ({mode_tag})\n"
+        f"🎯 *Sniper {AUTO_APPLY_CHEAP_MAX_PRICE:.0f}–{AUTO_APPLY_MID_MAX_PRICE:.0f} € :* Individuel, "
+        f"{AUTO_APPLY_MID_MIN_SURFACE_M2:.0f}–{AUTO_APPLY_MID_MAX_SURFACE_M2:.0f} m² ({mode_tag})\n"
+        f"🎯 *Sniper {AUTO_APPLY_MID_MAX_PRICE:.0f}–{AUTO_APPLY_SINGLE_MAX_PRICE:.0f} € :* Individuel, "
+        f"> {AUTO_APPLY_MID_MAX_SURFACE_M2:.0f} m² ({mode_tag})\n"
+        f"📢 *Alerte seule :* Colocation (toujours), Individuel {AUTO_APPLY_SINGLE_MAX_PRICE:.0f}–{MAX_PRICE:.0f} €"
+    )
+
+
 # Proxy manager integration
 try:
     import proxy_manager
@@ -160,6 +187,27 @@ try:
 except Exception:
     from datetime import timedelta
     PARIS_TZ = timezone(timedelta(hours=2))
+
+
+# One-time weekend bandwidth-conservation pause, agreed 2026-09-25: Webshare proxies
+# are on a 1GB bandwidth cap likely to run out before Monday's decision on whether to
+# buy more, and CROUS is assumed quiet on Sundays. This is a deliberate, time-boxed
+# FULL STOP of the automatic polling loop -- distinct from the permanent night/day
+# throttling feature (not built, and explicitly throttle-only / never-hard-stop per
+# the engineering handoff), which still needs real activity-logging data before it
+# can be designed. Telegram commands (/status, /check, /resume) keep working during
+# the pause so this can be manually overridden, and it self-expires after Monday
+# 2026-09-28 06:00 Paris time -- nothing to remember to remove later.
+WEEKEND_PAUSE_WINDOWS_PARIS = [
+    (datetime(2026, 9, 25, 0, 0, tzinfo=PARIS_TZ), datetime(2026, 9, 26, 6, 0, tzinfo=PARIS_TZ)),
+    (datetime(2026, 9, 26, 14, 0, tzinfo=PARIS_TZ), datetime(2026, 9, 28, 6, 0, tzinfo=PARIS_TZ)),
+]
+
+
+def in_weekend_pause_window(now_paris: datetime = None) -> bool:
+    """True while automatic polling should be fully paused for the weekend."""
+    now_paris = now_paris or datetime.now(PARIS_TZ)
+    return any(start <= now_paris < end for start, end in WEEKEND_PAUSE_WINDOWS_PARIS)
 
 
 def get_smart_cadence() -> tuple[int, str]:
@@ -357,10 +405,8 @@ def handle_telegram_command(cmd: str, on_check_callback=None):
             "• `/test` : Envoyer une notification de test\n"
             "• `/help` : Afficher ce message d'aide\n\n"
             f"🎯 *Ville ciblée :* {TARGET_CITY.capitalize()}\n"
-            f"⚡ *Sniper immédiat :* < {AUTO_APPLY_ANY_MAX_PRICE:.0f} € (Individuel ou Colocation)\n"
-            f"🎯 *Sniper ciblé :* {AUTO_APPLY_ANY_MAX_PRICE:.0f} € – {AUTO_APPLY_SINGLE_MAX_PRICE:.0f} € (Individuel uniquement)\n"
-            f"📢 *Alerte Telegram seule :* Jusqu'à {MAX_PRICE:.0f} € (Réservation manuelle)\n"
-            f"🤖 *Mode Sniper :* {'🧪 DRY-RUN' if AUTO_APPLY_DRY_RUN else '⚡ LIVE' if AUTO_APPLY_ENABLED else 'Désactivé'}"
+            f"{_format_sniper_rules_text()}\n"
+            f"🤖 *Auto-Apply :* {'Activé' if AUTO_APPLY_ENABLED else 'Désactivé'}"
         )
         send_telegram_message(help_text)
 
@@ -401,8 +447,14 @@ def handle_telegram_command(cmd: str, on_check_callback=None):
         else:
             proxy_display = current_proxy.split("@")[-1] if "@" in current_proxy else current_proxy
 
-        header_icon = "⏸️" if PAUSED else "🟢"
-        header_text = "CROUS Watcher en PAUSE (Tapez /resume)" if PAUSED else "CROUS Watcher Actif (24/7)"
+        in_weekend_pause = in_weekend_pause_window()
+        header_icon = "⏸️" if (PAUSED or in_weekend_pause) else "🟢"
+        if PAUSED:
+            header_text = "CROUS Watcher en PAUSE (Tapez /resume)"
+        elif in_weekend_pause:
+            header_text = "CROUS Watcher en PAUSE week-end (reprise 06h00 Paris)"
+        else:
+            header_text = "CROUS Watcher Actif (24/7)"
 
         status_text = (
             f"{header_icon} *{header_text}*\n\n"
@@ -415,9 +467,8 @@ def handle_telegram_command(cmd: str, on_check_callback=None):
             f"💾 *Offres déjà enregistrées :* {len(state.get('seen_ids', []))}\n"
             f"⚠️ *Échecs consécutifs :* {state.get('consecutive_failures', 0)}\n\n"
             f"🔐 *Session CROUS :* {'Connecté ✅' if is_logged_in else 'Non connecté / Expiré ❌'}\n"
-            f"⚡ *Sniper < {AUTO_APPLY_ANY_MAX_PRICE:.0f} € :* Tout mode ({'🧪 DRY-RUN' if AUTO_APPLY_DRY_RUN else '⚡ LIVE'})\n"
-            f"🎯 *Sniper {AUTO_APPLY_ANY_MAX_PRICE:.0f}–{AUTO_APPLY_SINGLE_MAX_PRICE:.0f} € :* Individuel seul ({'🧪 DRY-RUN' if AUTO_APPLY_DRY_RUN else '⚡ LIVE'})\n"
-            f"📢 *Alerte seule :* {AUTO_APPLY_SINGLE_MAX_PRICE:.0f} € – {MAX_PRICE:.0f} € (et Coloc 300–400€)\n"
+            f"🤖 *Auto-Apply :* {'Activé' if AUTO_APPLY_ENABLED else 'Désactivé'}\n"
+            f"{_format_sniper_rules_text()}\n"
             f"🎯 *Cible :* {TARGET_CITY.capitalize()}"
         )
         send_telegram_message(status_text)
@@ -601,6 +652,38 @@ def append_run_history(status: str, summary: str) -> None:
             f.writelines(lines)
     except Exception as err:
         logger.error(f"Failed to write history log: {err}")
+
+
+def record_marseille_listing(info: dict, tool_id: str, listing_url: str) -> None:
+    """
+    Append one line of raw structured data for every newly-seen Marseille listing,
+    regardless of price or whether it qualified for auto-apply. This is deliberately
+    unfiltered observational data (price, surface, room type, mode, coordinates,
+    timestamp) so the sniper's price/surface tier thresholds can eventually be tuned
+    against real market data instead of guessed at. Append-only JSONL (one JSON
+    object per line); never overwrites or trims previous entries.
+    """
+    entry = {
+        "seen_at": datetime.now(timezone.utc).isoformat(),
+        "id": info.get("id"),
+        "tool_id": tool_id,
+        "residence_name": info.get("residence_name"),
+        "label": info.get("label"),
+        "surface_m2": info.get("surface"),
+        "min_single_rent": info.get("min_single_rent"),
+        "min_coloc_rent": info.get("min_coloc_rent"),
+        "is_coloc": info.get("is_coloc"),
+        "should_auto_apply": info.get("should_auto_apply"),
+        "address": info.get("address"),
+        "lat": info.get("lat"),
+        "lon": info.get("lon"),
+        "url": listing_url,
+    }
+    try:
+        with open(LISTINGS_DATA_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as err:
+        logger.error(f"Failed to record listing data: {err}")
 
 
 # ==============================================================================
@@ -902,11 +985,17 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 def is_target_listing(item: dict) -> tuple[bool, dict]:
     """
-    Filter item according to TARGET_CITY, MAX_PRICE, and dual-tier auto-apply rules:
-    - Tier 1: rent < AUTO_APPLY_ANY_MAX_PRICE (300€) -> Snipe immediately, any mode (single or colocation)!
-    - Tier 2: 300€ <= rent <= AUTO_APPLY_SINGLE_MAX_PRICE (350€) -> Snipe ONLY IF individual (single) mode is available!
-    - Tier 3: 350€ < rent <= MAX_PRICE (400€) (or colocation in 300-400€) -> Alert only via Telegram, do NOT auto-apply.
-    - Tier 4: rent > MAX_PRICE (400€) -> Discard completely.
+    Filter item according to TARGET_CITY, MAX_PRICE, and price/surface-tiered
+    auto-apply rules. Individual (single) mode only -- colocation is never
+    auto-applied, always alert-only:
+    - rent < AUTO_APPLY_CHEAP_MAX_PRICE (250€) -> Snipe immediately, any surface.
+    - AUTO_APPLY_CHEAP_MAX_PRICE <= rent <= AUTO_APPLY_MID_MAX_PRICE (250-300€) ->
+      Snipe only if surface is between AUTO_APPLY_MID_MIN_SURFACE_M2 and
+      AUTO_APPLY_MID_MAX_SURFACE_M2 (12-19 m²), inclusive.
+    - AUTO_APPLY_MID_MAX_PRICE < rent <= AUTO_APPLY_SINGLE_MAX_PRICE (300-350€) ->
+      Snipe only if surface > AUTO_APPLY_MID_MAX_SURFACE_M2 (19 m²).
+    - Anything else within MAX_PRICE (400€) -> Alert only via Telegram, do NOT auto-apply.
+    - rent > MAX_PRICE (400€) -> Discard completely.
     Returns (matches, parsed_info_dict).
     """
     item_id = str(item.get("id", ""))
@@ -952,11 +1041,11 @@ def is_target_listing(item: dict) -> tuple[bool, dict]:
 
     # 1. Location match: prefer real coordinates from CROUS's own data (reliable),
     # fall back to address-text matching only if coordinates are missing.
+    location = residence.get("location") or {}
+    lat, lon = location.get("lat"), location.get("lon")
     if TARGET_CITY in ("all", "*", ""):
         city_match = True
     else:
-        location = residence.get("location") or {}
-        lat, lon = location.get("lat"), location.get("lon")
         if TARGET_CITY == "marseille" and lat is not None and lon is not None:
             city_match = _haversine_km(lat, lon, MARSEILLE_CENTER_LAT, MARSEILLE_CENTER_LON) <= MARSEILLE_RADIUS_KM
         else:
@@ -987,18 +1076,23 @@ def is_target_listing(item: dict) -> tuple[bool, dict]:
     should_auto_apply = False
     chosen_mode = "single"
     effective_rent = overall_min_rent
+    surface_val = surface if isinstance(surface, (int, float)) else None
 
-    if AUTO_APPLY_ENABLED:
-        # Check single mode under 350€ or 300€
-        if min_single_rent is not None and min_single_rent <= AUTO_APPLY_SINGLE_MAX_PRICE:
+    if AUTO_APPLY_ENABLED and min_single_rent is not None:
+        x = min_single_rent
+        if x < AUTO_APPLY_CHEAP_MAX_PRICE:
             should_auto_apply = True
+        elif AUTO_APPLY_CHEAP_MAX_PRICE <= x <= AUTO_APPLY_MID_MAX_PRICE:
+            should_auto_apply = (
+                surface_val is not None
+                and AUTO_APPLY_MID_MIN_SURFACE_M2 <= surface_val <= AUTO_APPLY_MID_MAX_SURFACE_M2
+            )
+        elif AUTO_APPLY_MID_MAX_PRICE < x <= AUTO_APPLY_SINGLE_MAX_PRICE:
+            should_auto_apply = surface_val is not None and surface_val > AUTO_APPLY_MID_MAX_SURFACE_M2
+
+        if should_auto_apply:
             chosen_mode = "single"
-            effective_rent = min_single_rent
-        # Check colocation mode under 300€
-        elif min_coloc_rent is not None and min_coloc_rent < AUTO_APPLY_ANY_MAX_PRICE:
-            should_auto_apply = True
-            chosen_mode = "colocation"
-            effective_rent = min_coloc_rent
+            effective_rent = x
 
     if not should_auto_apply:
         # For manual alerts: prioritize single rent if <= MAX_PRICE, else coloc / overall min
@@ -1022,7 +1116,11 @@ def is_target_listing(item: dict) -> tuple[bool, dict]:
         "address": address or "Marseille",
         "is_coloc": (chosen_mode == "colocation"),
         "target_mode": chosen_mode,
-        "should_auto_apply": should_auto_apply
+        "should_auto_apply": should_auto_apply,
+        "min_single_rent": min_single_rent,
+        "min_coloc_rent": min_coloc_rent,
+        "lat": lat,
+        "lon": lon,
     }
     return True, parsed
 
@@ -1103,6 +1201,7 @@ def check_and_notify() -> tuple[int, int]:
                 is_sniper_target = info["should_auto_apply"] and bool(apply_for_accommodation)
                 logger.info(f"✨ NEW LISTING: {info['residence_name']} ({info['price']}€) | Sniper Target: {is_sniper_target}")
                 listing_url = f"https://trouverunlogement.lescrous.fr/tools/{tool_id}/accommodations/{item_id}"
+                record_marseille_listing(info, tool_id, listing_url)
                 coloc_tag = " [Colocation]" if info["is_coloc"] else ""
 
                 # 1. SEND DIRECT LINK IMMEDIATELY so the user can apply manually without delay
@@ -1301,17 +1400,22 @@ def main_loop():
 
     state = load_state()
     last_heartbeat_day = None
+    was_in_weekend_pause = in_weekend_pause_window()
 
     # Send startup announcement to Telegram
     is_logged_in, _ = is_session_valid()
+    pause_notice = (
+        "\n⏸️ *Pause automatique du week-end active* -- surveillance suspendue "
+        "jusqu'à 06h00 (Paris). Tapez `/check` pour une vérification manuelle.\n"
+    ) if was_in_weekend_pause else ""
     startup_msg = (
         "🚀 *CROUS Watcher Démarré sur votre VPS !*\n\n"
         f"🎯 *Ville :* {TARGET_CITY.capitalize()}\n"
-        f"⚡ *Sniper < {AUTO_APPLY_ANY_MAX_PRICE:.0f} € :* Tout mode ({'🧪 DRY-RUN' if AUTO_APPLY_DRY_RUN else '⚡ LIVE'})\n"
-        f"🎯 *Sniper {AUTO_APPLY_ANY_MAX_PRICE:.0f}–{AUTO_APPLY_SINGLE_MAX_PRICE:.0f} € :* Individuel seul ({'🧪 DRY-RUN' if AUTO_APPLY_DRY_RUN else '⚡ LIVE'})\n"
-        f"📢 *Alerte Telegram seule :* Jusqu'à {MAX_PRICE:.0f} €\n"
+        f"🤖 *Auto-Apply :* {'Activé' if AUTO_APPLY_ENABLED else 'Désactivé'}\n"
+        f"{_format_sniper_rules_text()}\n"
         f"⏱️ *Cadence actuelle :* ~{cur_interval}s ({cur_cadence})\n"
-        f"🔐 *Session CROUS :* {'Active ✅' if is_logged_in else 'Non configurée / Expirée ❌'}\n\n"
+        f"🔐 *Session CROUS :* {'Active ✅' if is_logged_in else 'Non configurée / Expirée ❌'}\n"
+        f"{pause_notice}\n"
         "Je surveille en continu 24h/24. Envoyez `/status` pour voir les métriques ou `/check` pour vérifier."
     )
     broadcast_telegram_message(startup_msg)
@@ -1322,7 +1426,23 @@ def main_loop():
         # 1. Check for incoming Telegram commands (/status, /check, /test, /session, /renew, /test_apply, /pause, /resume)
         poll_telegram_updates(on_check_callback=check_and_notify)
 
-        if PAUSED:
+        now_in_weekend_pause = in_weekend_pause_window()
+        if now_in_weekend_pause != was_in_weekend_pause:
+            was_in_weekend_pause = now_in_weekend_pause
+            if now_in_weekend_pause:
+                send_telegram_message(
+                    "⏸️ *Pause automatique du week-end activée*\n\n"
+                    "Surveillance automatique suspendue pour préserver la bande passante des proxys.\n"
+                    "Reprise automatique prévue à 06h00 (heure de Paris).\n"
+                    "Tapez `/check` pour une vérification manuelle malgré tout."
+                )
+            else:
+                send_telegram_message(
+                    "▶️ *Pause automatique du week-end terminée*\n\n"
+                    "La surveillance 24/7 a repris normalement."
+                )
+
+        if PAUSED or now_in_weekend_pause:
             time.sleep(1)
             continue
 
