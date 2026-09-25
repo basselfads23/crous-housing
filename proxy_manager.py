@@ -17,6 +17,7 @@ class AllProxyGroupsExhaustedError(Exception):
 
 BASE_DIR = Path(__file__).resolve().parent
 PROXIES_FILE = BASE_DIR / "proxies.txt"
+RESIDENTIAL_PROXIES_FILE = BASE_DIR / "proxies_residential.txt"
 EXHAUSTED_GROUPS_FILE = BASE_DIR / ".exhausted_proxy_groups.json"
 EXHAUSTION_TTL_SECONDS = 24 * 3600  # 24 hours
 
@@ -24,19 +25,11 @@ EXHAUSTION_TTL_SECONDS = 24 * 3600  # 24 hours
 _CURRENT_INDEX = 0
 
 
-def load_proxies() -> list[str]:
-    """
-    Returns a list of proxy URLs in the form: http://user:pass@ip:port
-    Loads from CROUS_PROXY environment variable and/or proxies.txt.
-    Supports any number of proxies in proxies.txt.
-    """
+def _parse_proxies_file(path: Path) -> list[str]:
+    """Parse a host:port:user:pass (or full URL) proxy list file into http://user:pass@host:port URLs."""
     proxies = []
-    env_proxy = os.getenv("CROUS_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
-    if env_proxy:
-        proxies.append(env_proxy.strip())
-
-    if PROXIES_FILE.exists():
-        for line in PROXIES_FILE.read_text(encoding="utf-8").splitlines():
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -60,6 +53,38 @@ def load_proxies() -> list[str]:
             seen.add(p)
             unique.append(p)
     return unique
+
+
+def load_proxies() -> list[str]:
+    """
+    Returns the SCOUTER's datacenter proxy pool as a list of proxy URLs in the form
+    http://user:pass@ip:port. Loads from the CROUS_PROXY environment variable and/or
+    proxies.txt (cheap Webshare "Proxy Server" datacenter plan + Oxylabs).
+    """
+    proxies = []
+    env_proxy = os.getenv("CROUS_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+    if env_proxy:
+        proxies.append(env_proxy.strip())
+    proxies.extend(_parse_proxies_file(PROXIES_FILE))
+
+    seen = set()
+    unique = []
+    for p in proxies:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
+
+
+def load_residential_proxies() -> list[str]:
+    """
+    Returns the AUTH + SNIPER residential proxy pool (proxies_residential.txt --
+    Webshare "Static Residential" plan). Deliberately separate from load_proxies():
+    auth (login) and the sniper (apply flow) need to look like a real human, which
+    residential IPs do far better than datacenter ones; the scouter's bulk polling
+    doesn't need that and stays on the cheap datacenter pool.
+    """
+    return _parse_proxies_file(RESIDENTIAL_PROXIES_FILE)
 
 
 STATE_FILE = BASE_DIR / ".proxy_index"
@@ -243,19 +268,22 @@ def rotate_proxy(skip_exhausted: bool = True) -> str | None:
 def _sniper_candidate_list() -> list[str]:
     """
     Proxy ordering shared by get_sniper_proxy() and rotate_sniper_proxy(), so the
-    same stored index always refers to the same proxy in both functions. Webshare
-    proxies first (they support both CROUS and .gouv.fr auth), Oxylabs last.
+    same stored index always refers to the same proxy in both functions.
 
-    These two functions used to index into two DIFFERENT orderings (this
-    Webshare-first order vs. load_proxies()' raw file order) while sharing the
-    same stored index -- meaning a rotation triggered by a 429 could land on
-    essentially an arbitrary proxy, including possibly the one that just got
-    rate-limited, wasting a request for nothing.
+    Sources from the residential pool (load_residential_proxies()), not the
+    scouter's datacenter pool -- the sniper's multi-page apply flow is exactly the
+    kind of session where looking like a real human matters, which residential IPs
+    do far better than datacenter ones. (Prior to 2026-09-25 this sourced from the
+    datacenter pool with Webshare-first/Oxylabs-last ordering; that distinction is
+    moot now since the residential pool has no Oxylabs entries at all.)
+
+    NOTE: get_sniper_proxy() and rotate_sniper_proxy() used to index into two
+    DIFFERENT orderings while sharing the same stored index -- meaning a rotation
+    triggered by a 429 could land on essentially an arbitrary proxy, including
+    possibly the one that just got rate-limited, wasting a request for nothing.
+    Fixed 2026-09-25 by routing both through this single shared list.
     """
-    proxies = load_proxies()
-    webshare_proxies = [p for p in proxies if "oxylabs" not in p]
-    oxylabs_proxies = [p for p in proxies if "oxylabs" in p]
-    return webshare_proxies + oxylabs_proxies
+    return load_residential_proxies()
 
 
 def rotate_sniper_proxy() -> dict | None:
@@ -332,9 +360,16 @@ def get_playwright_proxy(proxy_url: str | None = None, rotate: bool = False) -> 
 def get_auth_proxy() -> dict | None:
     """
     Returns a dedicated, verified proxy for authentication with CROUS and MesServices.
-    Never uses excluded proxies (e.g. oxylabs), and ensures both finding housing and auth portals work.
+    Ensures both the housing site and the auth portal work before returning a candidate.
+
+    Sources from the residential pool (load_residential_proxies()), not the scouter's
+    datacenter pool -- login (Altcha challenge, cookies) is exactly the kind of flow
+    where looking like a real human matters. The residential pool has no Oxylabs
+    entries at all, so the AUTH_EXCLUDED_MARKERS filter that used to be needed here
+    (Oxylabs gets a hard 403 on the .gouv.fr login host specifically) is moot now --
+    left in place as a harmless defensive no-op in case that ever changes.
     """
-    proxies = load_proxies()
+    proxies = load_residential_proxies()
     candidates = [p for p in proxies if not any(m in p.lower() for m in AUTH_EXCLUDED_MARKERS)]
     if not candidates:
         logger.warning("No candidate proxies available for auth (all excluded or list empty).")

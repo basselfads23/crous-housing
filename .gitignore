@@ -14,6 +14,8 @@ screenshots/
 .vscode/
 
 proxies.txt
+proxies_residential.txt
+proxies.txt.bak-*
 .proxy_index
 .sniper_proxy_index
 .auth_proxy_index
