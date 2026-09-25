@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import json
+import math
 import random
 import signal
 import logging
@@ -832,6 +833,29 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
     return all_items
 
 
+# Marseille city center, used for coordinate-based location matching.
+# residence.location (lat/lon) comes straight from CROUS's own search API on
+# every listing (confirmed live: 0/50 sampled items missing it) and is far
+# more reliable than matching city names or postal codes in free-text
+# addresses, which can false-positive on things like street names ("Route de
+# Marseille" in a different town) or CEDEX-style postal codes CROUS uses for
+# some residences (e.g. 13288, 13388, 13331) that fall outside the standard
+# arrondissement range (13001-13016).
+MARSEILLE_CENTER_LAT = 43.2965
+MARSEILLE_CENTER_LON = 5.3698
+MARSEILLE_RADIUS_KM = 20.0
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two lat/lon points, in kilometers."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2)
+    return 2 * R * math.asin(math.sqrt(a))
+
+
 def is_target_listing(item: dict) -> tuple[bool, dict]:
     """
     Filter item according to TARGET_CITY, MAX_PRICE, and dual-tier auto-apply rules:
@@ -882,17 +906,23 @@ def is_target_listing(item: dict) -> tuple[bool, dict]:
         else:
             single_rents.append(rent_val)
 
-    # 1. Location match: Marseille city or postal codes 13001-13016 (or 'all' for nationwide)
+    # 1. Location match: prefer real coordinates from CROUS's own data (reliable),
+    # fall back to address-text matching only if coordinates are missing.
     if TARGET_CITY in ("all", "*", ""):
         city_match = True
     else:
-        addr_clean = address.lower()
-        marseille_postal_codes = [f"1300{i}" for i in range(1, 10)] + [f"1301{i}" for i in range(0, 7)] + ["13000"]
-        import re
-        city_match = (
-            bool(re.search(r'\b' + re.escape(TARGET_CITY) + r'\b', addr_clean)) or
-            any(pc in addr_clean for pc in marseille_postal_codes)
-        )
+        location = residence.get("location") or {}
+        lat, lon = location.get("lat"), location.get("lon")
+        if TARGET_CITY == "marseille" and lat is not None and lon is not None:
+            city_match = _haversine_km(lat, lon, MARSEILLE_CENTER_LAT, MARSEILLE_CENTER_LON) <= MARSEILLE_RADIUS_KM
+        else:
+            addr_clean = address.lower()
+            marseille_postal_codes = [f"1300{i}" for i in range(1, 10)] + [f"1301{i}" for i in range(0, 7)] + ["13000"]
+            import re
+            city_match = (
+                bool(re.search(r'\b' + re.escape(TARGET_CITY) + r'\b', addr_clean)) or
+                any(pc in addr_clean for pc in marseille_postal_codes)
+            )
 
     if not city_match:
         return False, {}
