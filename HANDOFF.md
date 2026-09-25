@@ -60,22 +60,48 @@ of 2026-09-25):
 - Auth silent-fallback removal + per-attempt proxy logging (commit f900af8).
 - get_auth_proxy() itself (built in an earlier session, commit 8d138d8) — reviewed today,
   confirmed correct as-is.
+- session_keeper.py audited (read-only, TASK 1) — reuses crous_auth.auto_login()/
+  check_session_status() directly (so it already gets the Oxylabs-exclusion + dual-host proxy
+  validation for free), writes session.json only via crous_auth's existing atomic write, never
+  touches proxy_manager's state files directly. crous_watcher.py's remaining
+  is_session_valid()/auto_login() call sites are manual-Telegram-command-only or a one-time
+  startup read; the automatic hourly path is confirmed gone. Still outside the git repo
+  (untracked) — bringing it in is a nice-to-have, not urgent, since it's already correct as-is.
+- Scouter city-match fix (commit eae726b, live as of 2026-09-25 17:37 UTC restart): matching now
+  uses residence.location (lat/lon, present on every live search-API item) with a 20km radius
+  from Marseille's center, instead of regex/postal-code matching on the free-text address. Fixes
+  a real false-positive class (address text containing "marseille" as part of an unrelated street
+  name, e.g. "Route de Marseille" in another town) and a real coverage gap (CROUS uses CEDEX-style
+  postal codes like 13288/13388/13331 that aren't in the old hardcoded 13001-13016 list). Verified
+  against the 4 real listings alerted this week (coordinates pulled live from each listing's own
+  page) plus synthetic false-positive/negative controls — see verify_city_match_fix.py, 7/7 pass.
+  Price-in-cents parsing (the `>1000 -> divide by 100` heuristic) was also reviewed against this
+  week's real listings (284.82€, 328.00€, etc. all came out exactly right) — looks correct in
+  practice, not currently a live bug, downgraded from the original suspicion.
 
 STILL OPEN, IN PRIORITY ORDER:
-1. TASK 1 below — audit session_keeper.py. Blocks fully trusting the auth fix.
-2. TASK 2 below — push to origin. Pure data-loss risk.
-3. Watch the scouter fix run a full day+, especially whether the second Webshare account
+1. TASK 2 below — push to origin. Pure data-loss risk.
+2. Watch the scouter fixes run a full day+, especially whether the second Webshare account
    ("kurosaki ichigo" / pismgcox) eventually hits its own 402.
-4. crous_apply.py audit — nobody has reviewed this file. Do this before ever enabling live
+3. crous_apply.py audit — nobody has reviewed this file. Do this before ever enabling live
    (non-dry-run) auto-apply.
-5. Sniper proxy logic — separately scoped, not yet audited.
+4. Sniper proxy logic — separately scoped, not yet audited.
+5. Sniper precision — once the scouter's matching is trusted, the sniper's own auto-apply
+   trigger logic (is_target_listing's should_auto_apply / dual-tier price thresholds) needs its
+   own pass so it only fires on genuinely great deals (e.g. a 250€ T1 at 14m², not just anything
+   under the tier cutoffs). Explicitly deferred until the scouter is solid — not started.
 6. Night/day request throttling — proposed, never built. Needs real activity-logging data FIRST
    (timestamp + day-of-week per listing seen) before changing cadence — "no listings at night/on
    Sundays" is currently an assumption. THROTTLE ONLY, never a hard stop, until weeks of data say
    otherwise (a missed rare listing costs more than the bandwidth saved). Do NOT touch Saturday —
    French government services can be open Saturdays.
-7. Cleanup: verify_proxy_group_fix.py, verify_fetch_listings_e2e.py, proxies.txt.bak-2026-09-25
-   are recent test/backup artifacts — move to tests/ or delete once no longer needed.
+7. Cleanup: verify_proxy_group_fix.py, verify_fetch_listings_e2e.py, verify_city_match_fix.py,
+   proxies.txt.bak-2026-09-25 are recent test/backup artifacts — move to tests/ or delete once no
+   longer needed.
+8. Webshare proxies are on a 1GB bandwidth cap and are expected to hit it within a couple of days
+   at current usage. Decision to buy more proxies was deliberately deferred pending ~a day of
+   testing to confirm Webshare's datacenter IPs hold up against messervices.etudiant.gouv.fr
+   (they do, per this handoff's proxies.txt notes) — revisit buying once they actually run dry.
 
 ## TASK 1 (DO FIRST): Audit session_keeper.py — READ-ONLY
 
