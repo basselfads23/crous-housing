@@ -567,7 +567,7 @@ def send_test_notification():
             [{"text": "🚀 Ouvrir le portail CROUS", "url": "https://trouverunlogement.lescrous.fr"}]
         ]
     }
-    success = broadcast_telegram_message(test_text, markup)
+    success = send_telegram_message(test_text, markup)
     if success:
         logger.info("Test notification dispatched successfully.")
 
@@ -1469,7 +1469,7 @@ def main_loop():
         f"🔐 *Session CROUS :* {'Active ✅' if is_logged_in else 'Non configurée / Expirée ❌'}\n\n"
         "Je surveille en continu 24h/24. Envoyez `/status` pour voir les métriques ou `/check` pour vérifier."
     )
-    broadcast_telegram_message(startup_msg)
+    send_telegram_message(startup_msg)
 
     while RUNNING:
         is_blocked_error = False
