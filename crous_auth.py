@@ -244,22 +244,31 @@ def auto_login(email: str = None, password: str = None) -> tuple[bool, str]:
     except ImportError:
         proxy_manager = None
 
+    if proxy_manager is None:
+        return False, "Module proxy_manager indisponible : aucune connexion directe (sans proxy) ne sera tentée."
+
     attempts = 0
-    while proxy_manager is not None and attempts < AUTH_MAX_PROXY_ATTEMPTS:
+    last_msg = "Aucun proxy d'authentification validé disponible (Oxylabs exclu de façon permanente)."
+    while attempts < AUTH_MAX_PROXY_ATTEMPTS:
         pw_proxy = proxy_manager.get_auth_proxy()
         if pw_proxy is None:
             logger.warning("No validated auth proxy available.")
             break
         attempts += 1
-        logger.info(f"Auth login attempt {attempts}/{AUTH_MAX_PROXY_ATTEMPTS} via proxy {pw_proxy['server']}")
+        proxy_label = pw_proxy["server"]
+        logger.info(f"Auth login attempt {attempts}/{AUTH_MAX_PROXY_ATTEMPTS} via proxy {proxy_label}")
         ok, msg, retryable = _auto_login_attempt(email, password, pw_proxy)
-        if ok or not retryable:
+        if ok:
+            logger.info(f"Auth login attempt {attempts}/{AUTH_MAX_PROXY_ATTEMPTS} via proxy {proxy_label} succeeded.")
             return ok, msg
-        logger.warning(f"Auth attempt {attempts} failed with a retryable error: {msg}")
+        last_msg = msg
+        if not retryable:
+            logger.warning(f"Auth login attempt {attempts}/{AUTH_MAX_PROXY_ATTEMPTS} via proxy {proxy_label} failed (non-retryable): {msg}")
+            return ok, msg
+        logger.warning(f"Auth login attempt {attempts}/{AUTH_MAX_PROXY_ATTEMPTS} via proxy {proxy_label} failed (retryable): {msg}")
 
-    logger.warning("Falling back to DIRECT (no proxy) connection for auth login.")
-    ok, msg, _ = _auto_login_attempt(email, password, None)
-    return ok, msg
+    logger.error(f"Auth login failed after {attempts} proxied attempt(s); no unproxied fallback will be attempted.")
+    return False, f"Échec de la connexion automatique via proxy après {attempts} tentative(s) : {last_msg}"
 
 
 def get_auth_cookies() -> dict[str, str]:
