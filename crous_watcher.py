@@ -36,6 +36,34 @@ LOG_FILE = BASE_DIR / "watcher.log"
 LISTINGS_DATA_FILE = BASE_DIR / "marseille_listings_data.jsonl"
 NATIONWIDE_SEEN_FILE = BASE_DIR / "nationwide_seen_ids.json"
 POSTING_ACTIVITY_FILE = BASE_DIR / "posting_activity.json"
+TELEGRAM_OFFSET_FILE = BASE_DIR / ".telegram_update_offset"
+
+
+def load_telegram_update_offset() -> int:
+    """
+    Persisted Telegram getUpdates offset, so a service restart doesn't reset it
+    to 0. Telegram redelivers any update not yet confirmed by a HIGHER offset for
+    up to 24 hours -- an in-memory-only offset (the bug this fixes, found
+    2026-09-25) means every restart could silently replay the entire backlog of
+    unconfirmed commands and button taps since the last confirmation, each
+    re-triggering a real action (e.g. a Snipe button tap firing a genuine second
+    apply attempt against CROUS with nobody touching anything).
+    """
+    if TELEGRAM_OFFSET_FILE.exists():
+        try:
+            return int(TELEGRAM_OFFSET_FILE.read_text().strip())
+        except Exception:
+            pass
+    return 0
+
+
+def save_telegram_update_offset(offset: int) -> None:
+    temp_file = TELEGRAM_OFFSET_FILE.with_suffix(".tmp")
+    try:
+        temp_file.write_text(str(offset))
+        temp_file.replace(TELEGRAM_OFFSET_FILE)
+    except Exception as err:
+        logger.error(f"Failed to save {TELEGRAM_OFFSET_FILE}: {err}")
 
 # Fix Windows console UTF-8 output
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -229,7 +257,7 @@ METRICS = {
     "total_checks": 0,
     "last_active_listings_count": 0,
     "last_error": None,
-    "telegram_update_offset": 0,
+    "telegram_update_offset": load_telegram_update_offset(),
     "current_cadence_mode": "Initialisation",
 }
 
@@ -462,6 +490,11 @@ def poll_telegram_updates(on_check_callback=None):
             for update in data.get("result", []):
                 update_id = update["update_id"]
                 METRICS["telegram_update_offset"] = update_id + 1
+                # Persisted immediately, before handling -- not after -- so a
+                # restart (even mid-handling of a long-running snipe) can never
+                # replay this update again. See load_telegram_update_offset()'s
+                # docstring for why an in-memory-only offset was a real bug.
+                save_telegram_update_offset(update_id + 1)
 
                 callback_query = update.get("callback_query")
                 if callback_query:
@@ -483,6 +516,26 @@ def poll_telegram_updates(on_check_callback=None):
                 handle_telegram_command(text, on_check_callback)
     except Exception as err:
         logger.debug(f"Error checking Telegram updates: {err}")
+
+
+def pick_test_apply_target(items: list[dict]) -> str | None:
+    """
+    Picks which listing /test_apply should run its dry-run against.
+
+    Bug fixed 2026-09-25: this used to blindly take items[0] from a full
+    nationwide fetch -- an unpredictable, possibly already-unavailable listing
+    that changes every call, nothing like the stable target used for manual
+    CLI verification (which always tested the same known-good listing).
+    Prefers the first listing CROUS itself marks "available", so this doesn't
+    fail on a listing that's simply already full/expired for reasons unrelated
+    to the sniper at all. Falls back to items[0] if none are marked available,
+    and to None (caller keeps its own hardcoded default) if items is empty.
+    """
+    if not items:
+        return None
+    available_item = next((it for it in items if it.get("available")), None)
+    chosen = available_item or items[0]
+    return str(chosen.get("id", "6"))
 
 
 def handle_telegram_command(cmd: str, on_check_callback=None):
@@ -611,8 +664,9 @@ def handle_telegram_command(cmd: str, on_check_callback=None):
         tool_id = "47"
         try:
             items = fetch_all_crous_listings(tool_id)
-            if items:
-                sample_acc_id = str(items[0].get("id", "6"))
+            picked = pick_test_apply_target(items)
+            if picked is not None:
+                sample_acc_id = picked
         except Exception:
             pass
 
