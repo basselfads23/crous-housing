@@ -145,41 +145,67 @@ low-priority polish, not correctness risks — see below.
   coordinates, link, timestamp) for future tier tuning against real data. Verified with
   verify_listings_data_recording.py, 18/18 pass.
 
-- Weekend bandwidth-conservation pause (commit 7277995 + 55463af, live as of 2026-09-25 19:58 UTC
-  restart, confirmed 0 automatic check cycles since restart): ONE-TIME, time-boxed full stop of
-  automatic polling — paused now through Saturday 06:00 Paris time, active Saturday 06:00–14:00,
-  paused again through Monday 06:00, back to normal after that with nothing to remove (self-
-  expiring date-anchored windows, not a recurring rule). Telegram commands stay live throughout.
-  Distinct from the permanent night/day throttling feature below (still not built). Verified with
-  verify_weekend_pause_window.py, 12/12 pass.
+- Weekend bandwidth-conservation pause: built (commit 7277995 + 55463af), then REMOVED entirely
+  (commit f083b1d, live as of 2026-09-25 21:xx UTC restart) once its only justification (the
+  free-tier 1GB cap) was resolved by purchasing paid Webshare plans same day — no reason to keep
+  dead time-boxed logic around. verify_weekend_pause_window.py deleted with it. Bot runs normally
+  24/7 again, no special weekend behavior.
+- Proxy pools split (commit 4f01930, live as of 2026-09-25 20:55 UTC restart): purchased two paid
+  Webshare plans via their API (proxy.webshare.io/api/v2) — 200 datacenter proxies ("Proxy Server",
+  $5.98/mo) and 20 static residential proxies ("Static Residential", $6.00/mo), both with 250GB
+  bandwidth included (actual usage ~0.6GB/month at the time, so bandwidth is a non-issue at either
+  tier). Old free 10-proxy plan auto-cancelled by Webshare on purchase. Datacenter IPs are
+  trivially identifiable via ASN lookup as hosting infrastructure — fine for the scouter's plain
+  polling, but exactly the signal that can hurt a login flow or multi-page apply session. Residential
+  IPs (confirmed real ISPs: Comcast, Orange, Rogers, Telecom Italia, etc via the API's asn_name
+  field) look like a real human. Scouter stays on datacenter (proxies.txt); get_auth_proxy() and
+  the sniper (_sniper_candidate_list(), shared by get_sniper_proxy()/rotate_sniper_proxy()) now
+  source from the new residential pool (proxies_residential.txt, gitignored — real credentials).
+  Verified both with fully-mocked tests AND live: a live get_auth_proxy() call picked a real
+  residential IP that passed both required CROUS checks first try; a live end-to-end
+  crous_apply.py --dry-run succeeded through the new residential proxy, reaching Step 2 in 22.96s
+  (faster than the equivalent datacenter-proxy run minutes earlier, 31.22s).
+- Posting-activity tracker (commit f083b1d, live): record_posting_activity() now records, once per
+  check_and_notify() cycle, the first/last-seen timestamp and count of newly-detected listings each
+  Paris-local day, nationwide and Marseille separately, to posting_activity.json (gitignored, like
+  other runtime data). Confirmed via live API query that CROUS has no posting-timestamp field at
+  all, so "when we first observed it" is the only available signal. Goal: eventually replace the
+  untested "quiet at night/on Sundays" assumption behind smart-cadence with real evidence. Verified
+  with verify_posting_activity_tracking.py, 7/7 pass, plus a live check_and_notify() run.
+- crous_apply.py dry-run open question: considered RESOLVED (explicit call, 2026-09-25) — the
+  screenshot evidence (CROUS's own copy: "vous recevrez une réponse dans un délai de quelques
+  jours", plus a "Modifier mon formulaire" go-back option on the review screen) is good enough to
+  trust. Not proven via network trace, but not being pursued further.
+- The "couple" occupation-type mislabeling edge case: considered IRRELEVANT (explicit call,
+  2026-09-25) — colocation/couple pricing doesn't matter since only individual sniping is in scope.
+  Only follow up if the mere PRESENCE of a third radio option (when "couple" mode exists on a page)
+  is ever observed to shift button positions/layout in a way that breaks Playwright's mode
+  selection — would need real listing data to diagnose if so.
+- AUTO_APPLY_ENABLED flipped to true (commit pending push, .env not tracked by git) — explicit call,
+  2026-09-25: "turn it to true, this is it, there is nothing to lose". Sniper will now actually
+  attempt DRY-RUN applies on qualifying Marseille listings. AUTO_APPLY_DRY_RUN is still true —
+  nothing will be live-submitted.
 
 STILL OPEN, IN PRIORITY ORDER:
-1. TASK 2 below — push to origin. Pure data-loss risk. 20 commits local, unpushed.
-2. Resolve the crous_apply.py dry-run open question (see above) — live, watched test needed before
-   trusting DRY-RUN further or ever flipping AUTO_APPLY_DRY_RUN off.
-3. AUTO_APPLY_ENABLED is still false in .env — sniper won't fire at all (independent of DRY_RUN)
-   until this is manually flipped true. Deliberately left as a manual decision, not automated.
-4. Watch the scouter fixes run a full day+, especially whether the second Webshare account
-   ("kurosaki ichigo" / pismgcox) eventually hits its own 402. Note: watching is paused along with
-   everything else during the weekend pause window above.
-5. Night/day request throttling (the PERMANENT version) — proposed, never built. Needs real
-   activity-logging data FIRST (timestamp + day-of-week per listing seen) before changing cadence —
-   "no listings at night/on Sundays" is currently an assumption. THROTTLE ONLY, never a hard stop,
-   until weeks of data say otherwise. Do NOT touch Saturday — French government services can be
-   open Saturdays. (The weekend pause above is a separate, deliberate, temporary exception to this
-   principle, justified by the concrete Webshare bandwidth constraint — not a policy change.)
-6. Cleanup: seen_ids in listings_seen.json grows forever, never trimmed — low priority. Also move
-   verify_proxy_group_fix.py, verify_fetch_listings_e2e.py, verify_city_match_fix.py,
-   verify_tool_id_discovery_fix.py, verify_apply_mode_selection_fix.py, verify_sniper_tier_logic.py,
-   verify_sniper_proxy_index_fix.py, verify_weekend_pause_window.py,
-   verify_listings_data_recording.py, proxies.txt.bak-2026-09-25 to tests/ or delete once no longer
-   needed.
-7. Webshare proxies are on a 1GB bandwidth cap. Decision to buy more proxies was deliberately
-   deferred pending ~a day of testing to confirm Webshare's datacenter IPs hold up against
-   messervices.etudiant.gouv.fr (they do, per this handoff's proxies.txt notes) — revisit Monday,
-   partly informed by whatever marseille_listings_data.jsonl has collected by then.
-8. The "couple" occupation-type mislabeling edge case noted above — low priority, zero observed
-   occurrences.
+1. Push to origin — deliberately deferred until after the upcoming Telegram messaging work, then
+   push everything together. ~24 commits local, unpushed.
+2. Watch the scouter run for real, now that AUTO_APPLY_ENABLED is true and the weekend pause is
+   gone — first real end-to-end live sniper attempt on an actual new Marseille listing hasn't
+   happened yet (everything so far has been manual dry-run tests against non-Marseille listings).
+   Also watch whether the second Webshare account ("kurosaki ichigo" / pismgcox, still disabled in
+   proxies.txt) or the new proxy pools hit any unexpected issues.
+3. Night/day request throttling (the PERMANENT version) — proposed, never built. Now has a real
+   data source to eventually use (posting_activity.json) instead of the untested assumption —
+   revisit once a meaningful number of days have accumulated. THROTTLE ONLY, never a hard stop, per
+   original reasoning (a missed rare listing costs more than the bandwidth saved) — though note
+   bandwidth is no longer the constraint it was, so the cost/benefit of throttling at all may need
+   re-examining once there's real posting-hours data to look at.
+4. Cleanup: seen_ids in listings_seen.json and nationwide_seen_ids.json both grow forever, never
+   trimmed — low priority. Also move verify_proxy_group_fix.py, verify_fetch_listings_e2e.py,
+   verify_city_match_fix.py, verify_tool_id_discovery_fix.py, verify_apply_mode_selection_fix.py,
+   verify_sniper_tier_logic.py, verify_sniper_proxy_index_fix.py, verify_auth_proxy_residential_pool.py,
+   verify_listings_data_recording.py, verify_posting_activity_tracking.py, proxies.txt.bak-2026-09-25
+   to tests/ or delete once no longer needed.
 
 ## TASK 1 (DO FIRST): Audit session_keeper.py — READ-ONLY
 
