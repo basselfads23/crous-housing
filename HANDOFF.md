@@ -90,15 +90,38 @@ Scouter is now considered solid enough to move on from, per the plan to fully ha
 starting sniper work. Remaining scouter items (night/day throttling, seen_ids cleanup) are
 low-priority polish, not correctness risks — see below.
 
+- crous_apply.py audited (read-only, TASK 2 [renumbered from earlier draft]) and fixed (commit
+  1ac0bee, live as of 2026-09-25 18:39 UTC restart): occupation-mode selection (radio button and
+  dropdown) used to silently default to whichever option came first in the DOM if none matched the
+  requested mode — for a "colocation" target with no "coloc"-labeled option, that's very likely
+  "Individuel", meaning the sniper could have submitted a request for the wrong room type on a
+  listing chosen specifically for its colocation price. Extracted the matching into a standalone,
+  unit-tested `_pick_mode_index()` that returns "no match" instead of guessing; callers now hard-fail
+  (log + screenshot + error result) instead of proceeding on an unverified mode. This ran in both
+  DRY-RUN and LIVE paths (mode selection happens before the dry-run/live branch), so it was live in
+  production DRY-RUN runs too. Also fixed: study-level selection failures now log a warning instead
+  of failing silently; screenshots older than 14 days are now pruned automatically. Verified with
+  verify_apply_mode_selection_fix.py, 10/10 pass.
+  OPEN QUESTION FROM THIS AUDIT, NOT YET RESOLVED: dry-run mode still performs the real
+  "Ajouter à ma sélection" (add to cart) and Step-1 "Vérifier ma demande" actions against the live
+  CROUS site before stopping at the final confirmation click — it's unconfirmed whether that leaves
+  any real state behind (a held/reserved unit, a pending request record, a quota hit) on the CROUS
+  account. Needs a deliberate, watched live test (checking the real CROUS account afterward), not
+  something to assume either way. Do this before trusting DRY-RUN's safety further, and definitely
+  before ever flipping AUTO_APPLY_DRY_RUN off.
+  ALSO OUT OF SCOPE (deliberately, per the three-proxy-systems isolation rule): get_sniper_proxy()'s
+  own internal selection/health-check logic in proxy_manager.py — only its return shape was checked
+  (to confirm proxy credentials never reach sniper.log, which they don't — verified). Its actual
+  selection behavior is still TASK 3 below, unaudited.
+
 STILL OPEN, IN PRIORITY ORDER:
 1. TASK 2 below — push to origin. Pure data-loss risk.
-2. crous_apply.py audit — nobody has reviewed this file. Do this before ever enabling live
-   (non-dry-run) auto-apply. NEXT UP.
-3. Sniper proxy logic — separately scoped, not yet audited.
-4. Sniper precision — once crous_apply.py is audited, the sniper's own auto-apply trigger logic
-   (is_target_listing's should_auto_apply / dual-tier price thresholds) needs its own pass so it
-   only fires on genuinely great deals (e.g. a 250€ T1 at 14m², not just anything under the tier
-   cutoffs). Explicitly deferred until the scouter + apply logic are both trusted — not started.
+2. Resolve the crous_apply.py dry-run open question above — live, watched test needed.
+3. Sniper proxy logic (get_sniper_proxy() in proxy_manager.py) — separately scoped, not yet audited.
+4. Sniper precision — the sniper's own auto-apply trigger logic (is_target_listing's
+   should_auto_apply / dual-tier price thresholds) needs its own pass so it only fires on genuinely
+   great deals (e.g. a 250€ T1 at 14m², not just anything under the tier cutoffs). Explicitly
+   deferred until the scouter + apply logic are both trusted — not started.
 5. Watch the scouter fixes run a full day+, especially whether the second Webshare account
    ("kurosaki ichigo" / pismgcox) eventually hits its own 402.
 6. Night/day request throttling — proposed, never built. Needs real activity-logging data FIRST
@@ -108,8 +131,8 @@ STILL OPEN, IN PRIORITY ORDER:
    French government services can be open Saturdays.
 7. Cleanup: seen_ids in listings_seen.json grows forever, never trimmed — low priority. Also move
    verify_proxy_group_fix.py, verify_fetch_listings_e2e.py, verify_city_match_fix.py,
-   verify_tool_id_discovery_fix.py, proxies.txt.bak-2026-09-25 to tests/ or delete once no
-   longer needed.
+   verify_tool_id_discovery_fix.py, verify_apply_mode_selection_fix.py, proxies.txt.bak-2026-09-25
+   to tests/ or delete once no longer needed.
 8. Webshare proxies are on a 1GB bandwidth cap and are expected to hit it within a couple of days
    at current usage. Decision to buy more proxies was deliberately deferred pending ~a day of
    testing to confirm Webshare's datacenter IPs hold up against messervices.etudiant.gouv.fr
