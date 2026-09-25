@@ -19,6 +19,7 @@ proxies.txt.bak-*
 .proxy_index
 .sniper_proxy_index
 .auth_proxy_index
+.telegram_update_offset
 .chrome_cache/
 venv/
 *.tmp
