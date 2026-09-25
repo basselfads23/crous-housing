@@ -290,21 +290,20 @@ def send_telegram_message(text: str, reply_markup: dict = None, chat_id: str = N
         return False
 
 
-def broadcast_telegram_message(text: str, reply_markup: dict = None) -> bool:
-    """Send to the admin chat plus every configured viewer chat ID. Returns True if at least one send succeeded."""
-    recipients = []
-    seen = set()
-    for cid in [TELEGRAM_CHAT_ID] + get_viewer_chat_ids():
-        if cid and cid not in seen:
-            seen.add(cid)
-            recipients.append(cid)
-    results = [send_telegram_message(text, reply_markup=reply_markup, chat_id=cid) for cid in recipients]
-    return any(results)
+def send_telegram_photo(photo_path: str, caption: str = "", reply_markup: dict = None, chat_id: str = None) -> bool:
+    """
+    Send a photo attachment with caption to the configured Telegram chat.
 
-
-def send_telegram_photo(photo_path: str, caption: str = "") -> bool:
-    """Send a photo attachment with caption to the configured Telegram chat."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    reply_markup was silently dropped before (this function never accepted it, though
+    two call sites in check_and_notify() passed it anyway) -- meaning any real
+    auto-snipe result with a screenshot would have raised a TypeError, crashing mid
+    check_and_notify() *before* seen_ids gets saved, causing the same listing to be
+    re-alerted and re-sniped on every subsequent cycle. Never triggered in production
+    before AUTO_APPLY_ENABLED was flipped true (2026-09-25), so it stayed dormant.
+    Fixed same day, before any real auto-snipe had a chance to hit it.
+    """
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not target:
         return False
     if not os.path.exists(photo_path):
         logger.warning(f"Photo path does not exist: {photo_path}")
@@ -313,14 +312,17 @@ def send_telegram_photo(photo_path: str, caption: str = "") -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     try:
         import requests
+        data = {
+            "chat_id": target,
+            "caption": caption[:1024],
+            "parse_mode": "Markdown"
+        }
+        if reply_markup:
+            data["reply_markup"] = json.dumps(reply_markup)
         with open(photo_path, "rb") as f:
             resp = requests.post(
                 url,
-                data={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "caption": caption[:1024],
-                    "parse_mode": "Markdown"
-                },
+                data=data,
                 files={"photo": f},
                 timeout=25
             )
@@ -328,6 +330,118 @@ def send_telegram_photo(photo_path: str, caption: str = "") -> bool:
     except Exception as err:
         logger.error(f"Failed to send Telegram photo: {err}")
         return False
+
+
+def answer_telegram_callback(callback_query_id: str, text: str = "") -> None:
+    """Acknowledge a Telegram inline-button tap so the client stops showing a spinner."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+    payload = {"callback_query_id": callback_query_id, "text": text[:200]}
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as err:
+        logger.warning(f"Failed to answer Telegram callback: {err}")
+
+
+# accommodation_id -> unix timestamp of last manual-snipe trigger. Debounces a
+# double-tap (or the same button tapped twice) from launching two concurrent/
+# back-to-back snipe attempts on the same listing -- back-to-back attempts are a
+# real, confirmed way to trigger CROUS's own rate limiting (observed live
+# 2026-09-25: 2 of 5 rapid attempts got HTTP 429'd). In-memory only, resets on
+# restart -- this is a short-lived debounce, not state worth persisting.
+_recent_manual_snipes: dict[str, float] = {}
+MANUAL_SNIPE_DEBOUNCE_SECONDS = 90
+
+
+def handle_telegram_callback(callback_query: dict) -> None:
+    """
+    Handle a tap on the owner-only "🎯 Snipe" button attached to a listing alert
+    that the automatic price/surface tiers didn't already fire on. Runs the exact
+    same apply_for_accommodation() engine as the automatic sniper, respecting
+    AUTO_APPLY_DRY_RUN -- this is not a separate, less-safe path.
+    """
+    cq_id = callback_query.get("id", "")
+    chat_id = str(callback_query.get("message", {}).get("chat", {}).get("id", ""))
+    data = callback_query.get("data", "")
+
+    # Security: the button only ever appears in the owner's own copy of the alert
+    # (see check_and_notify()), so this should be unreachable for the viewer --
+    # checked anyway, defensively, same spirit as the message-command check above.
+    if chat_id != TELEGRAM_CHAT_ID:
+        answer_telegram_callback(cq_id, "Non autorisé.")
+        return
+
+    parts = data.split(":")
+    if len(parts) != 4 or parts[0] != "snipe":
+        answer_telegram_callback(cq_id, "Bouton invalide.")
+        return
+    _, tool_id, accommodation_id, target_mode = parts
+
+    now = time.time()
+    last = _recent_manual_snipes.get(accommodation_id, 0.0)
+    if now - last < MANUAL_SNIPE_DEBOUNCE_SECONDS:
+        answer_telegram_callback(cq_id, "Déjà tenté récemment pour cette offre -- patientez avant de réessayer.")
+        return
+    _recent_manual_snipes[accommodation_id] = now
+
+    if not apply_for_accommodation:
+        answer_telegram_callback(cq_id, "Module sniper indisponible.")
+        return
+
+    answer_telegram_callback(cq_id, "🎯 Sniper lancé...")
+    listing_url = f"https://trouverunlogement.lescrous.fr/tools/{tool_id}/accommodations/{accommodation_id}"
+    logger.info(
+        f"⚡ [MANUAL SNIPE] Triggered via Telegram button for {accommodation_id} "
+        f"(mode={target_mode}, DRY_RUN={AUTO_APPLY_DRY_RUN})..."
+    )
+    try:
+        apply_res = apply_for_accommodation(
+            tool_id=tool_id,
+            accommodation_id=accommodation_id,
+            target_mode=target_mode,
+            dry_run=AUTO_APPLY_DRY_RUN
+        )
+    except Exception as apply_err:
+        logger.error(f"Error executing manual snipe: {apply_err}")
+        apply_res = {"success": False, "error": str(apply_err)}
+
+    result_markup = {"inline_keyboard": [[{"text": "🚀 Ouvrir l'offre CROUS", "url": listing_url}]]}
+    if apply_res.get("success"):
+        if AUTO_APPLY_DRY_RUN:
+            caption = (
+                "🧪 *[DRY-RUN - SNIPE MANUEL VÉRIFIÉ]*\n\n"
+                f"🆔 *Offre :* #{accommodation_id}\n"
+                f"⏱️ *Temps d'exécution :* {apply_res.get('duration_seconds', '?')}s\n\n"
+                "ℹ️ Étape 2 (récapitulatif) atteinte avec succès. Capture d'écran générée sans validation finale."
+            )
+        else:
+            caption = (
+                "🎯 *[RÉSERVATION SNIPÉE MANUELLEMENT !]*\n\n"
+                f"🆔 *Offre :* #{accommodation_id}\n"
+                f"⏱️ *Snipé en :* {apply_res.get('duration_seconds', '?')}s\n\n"
+                f"🔗 [Accéder à mon panier]({apply_res.get('cart_url', listing_url)})"
+            )
+        if apply_res.get("screenshot_path"):
+            send_telegram_photo(apply_res["screenshot_path"], caption, reply_markup=result_markup)
+        else:
+            send_telegram_message(caption, reply_markup=result_markup)
+    else:
+        err_msg = (
+            "⚠️ *[SNIPE MANUEL : ÉCHEC]*\n\n"
+            f"🆔 *Offre :* #{accommodation_id}\n"
+            f"❌ *Raison :* `{apply_res.get('error', 'Erreur inconnue')}`\n\n"
+            f"⚡ *Poursuivez manuellement :*\n{listing_url}"
+        )
+        if apply_res.get("screenshot_path"):
+            send_telegram_photo(apply_res["screenshot_path"], err_msg, reply_markup=result_markup)
+        else:
+            send_telegram_message(err_msg, reply_markup=result_markup)
 
 
 def poll_telegram_updates(on_check_callback=None):
@@ -348,6 +462,11 @@ def poll_telegram_updates(on_check_callback=None):
             for update in data.get("result", []):
                 update_id = update["update_id"]
                 METRICS["telegram_update_offset"] = update_id + 1
+
+                callback_query = update.get("callback_query")
+                if callback_query:
+                    handle_telegram_callback(callback_query)
+                    continue
 
                 msg = update.get("message", {})
                 chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -1188,6 +1307,28 @@ def is_target_listing(item: dict) -> tuple[bool, dict]:
     return True, parsed
 
 
+def build_alert_markups(
+    listing_url: str, is_sniper_target: bool, tool_id: str, item_id: str, target_mode: str
+) -> tuple[dict, dict]:
+    """
+    Builds the (owner_markup, viewer_markup) inline keyboards for a new-listing
+    alert. Both get the "open listing" link; only the owner's copy additionally
+    gets a "🎯 Snipe" button, and only when the listing wasn't already
+    auto-sniped (is_sniper_target) -- the button is for listings the automatic
+    price/surface tiers were too strict to catch, not a duplicate trigger for
+    ones that already fired.
+    """
+    open_button = {"text": "⚡ Ouvrir l'offre & Postuler immédiatement", "url": listing_url}
+    viewer_markup = {"inline_keyboard": [[open_button]]}
+    owner_markup = {"inline_keyboard": [[open_button]]}
+    if not is_sniper_target:
+        owner_markup["inline_keyboard"].append([{
+            "text": "🎯 Snipe",
+            "callback_data": f"snipe:{tool_id}:{item_id}:{target_mode}"
+        }])
+    return owner_markup, viewer_markup
+
+
 def check_and_notify() -> tuple[int, int]:
     """
     Core check cycle:
@@ -1298,12 +1439,12 @@ def check_and_notify() -> tuple[int, int]:
                     + ("🤖 *Le sniper tente également l'auto-candidature en parallèle...*" if is_sniper_target
                        else "ℹ️ *Alerte manuelle : réservation requise via le lien ci-dessus.*")
                 )
-                reply_markup = {
-                    "inline_keyboard": [
-                        [{"text": "⚡ Ouvrir l'offre & Postuler immédiatement", "url": listing_url}]
-                    ]
-                }
-                broadcast_telegram_message(alert_text, reply_markup=reply_markup)
+                owner_markup, viewer_markup = build_alert_markups(
+                    listing_url, is_sniper_target, tool_id, item_id, info.get("target_mode", "single")
+                )
+                send_telegram_message(alert_text, reply_markup=owner_markup)
+                for viewer_cid in get_viewer_chat_ids():
+                    send_telegram_message(alert_text, reply_markup=viewer_markup, chat_id=viewer_cid)
 
                 # 2. AFTER SENDING, ATTEMPT THE SNIPE (if listing qualifies for auto-apply)
                 if is_sniper_target:
