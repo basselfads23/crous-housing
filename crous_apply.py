@@ -60,6 +60,51 @@ logging.basicConfig(
 logger = logging.getLogger("crous_apply")
 
 
+def _pick_mode_index(label_texts: list[str], target_mode: str) -> int | None:
+    """
+    Given a list of lowercased label texts (in DOM order) for a set of occupation-mode
+    radio buttons or <select> options, return the index of the one matching target_mode
+    ("single", "colocation", or "any").
+
+    Returns None if nothing matches for "single"/"colocation" -- deliberately does NOT
+    fall back to an arbitrary option, so the caller can fail loudly instead of silently
+    submitting a request for the wrong occupation mode (this used to default to index 0,
+    which for a "colocation" target with no matching label would very likely select
+    "Individuel" instead -- exactly the kind of wrong-mode misfire the price-tier
+    targeting in crous_watcher.py's is_target_listing() is trying to avoid).
+
+    "any" (CLI-only manual testing mode, never produced by the automated watcher) has no
+    price-tier precision to protect, so it falls back to the first option.
+    """
+    for i, text in enumerate(label_texts):
+        if target_mode == "single" and ("seul" in text or "indiv" in text):
+            return i
+        if target_mode == "colocation" and "coloc" in text:
+            return i
+        if target_mode == "any" and ("seul" in text or "indiv" in text):
+            return i
+    if target_mode == "any" and label_texts:
+        return 0
+    return None
+
+
+SCREENSHOT_MAX_AGE_DAYS = 14
+
+
+def _prune_old_screenshots(max_age_days: int = SCREENSHOT_MAX_AGE_DAYS) -> None:
+    """Delete screenshots older than max_age_days so the directory doesn't grow forever."""
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        for f in SCREENSHOTS_DIR.glob("*.png"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _apply_for_accommodation_core(
     tool_id: str,
     accommodation_id: str,
@@ -314,72 +359,73 @@ def _apply_for_accommodation_core(
                     pass
                 return result
 
-            # 3. Fill Occupation Mode (support radio button and select dropdown)
+            # 3. Fill Occupation Mode (support radio button and select dropdown). Whichever
+            # selector is actually present is treated as authoritative; if it doesn't have
+            # an option matching the requested mode, fail loudly instead of guessing --
+            # silently submitting the wrong occupation mode would defeat the whole point of
+            # the price-tier targeting upstream in crous_watcher.py's is_target_listing().
             result["step"] = "filling_fields"
-            radios = page.locator("input[type='radio']").all()
             selected_radio = None
+            mode_selected = False
+
+            radios = page.locator("input[type='radio']").all()
             if radios:
-                for r in radios:
-                    r_id = r.get_attribute("id")
+                radio_ids = [r.get_attribute("id") for r in radios]
+                label_texts = []
+                for r_id in radio_ids:
                     label_el = page.locator(f"label[for='{r_id}']").first if r_id else None
-                    label_text = label_el.inner_text().lower() if (label_el and label_el.count() > 0) else ""
+                    label_texts.append(label_el.inner_text().lower() if (label_el and label_el.count() > 0) else "")
 
-                    if target_mode == "single" and ("seul" in label_text or "indiv" in label_text):
-                        selected_radio = r
-                        break
-                    elif target_mode == "colocation" and "coloc" in label_text:
-                        selected_radio = r
-                        break
-
-                if not selected_radio:
-                    if target_mode != "colocation":
-                        for r in radios:
-                            r_id = r.get_attribute("id")
-                            label_el = page.locator(f"label[for='{r_id}']").first if r_id else None
-                            label_text = label_el.inner_text().lower() if (label_el and label_el.count() > 0) else ""
-                            if "seul" in label_text or "indiv" in label_text:
-                                selected_radio = r
-                                break
-                    if not selected_radio and radios:
-                        selected_radio = radios[0]
-
-                if selected_radio:
-                    r_id = selected_radio.get_attribute("id")
-                    label_el = page.locator(f"label[for='{r_id}']").first if r_id else None
-                    if label_el and label_el.count() > 0:
-                        label_el.click()
-                    selected_radio.check(force=True)
+                idx = _pick_mode_index(label_texts, target_mode)
+                if idx is None:
+                    err = (f"No radio button matches requested mode '{target_mode}' "
+                           f"(found labels: {label_texts}); refusing to guess.")
+                    logger.error(err)
+                    result["error"] = err
+                    result["step"] = "mode_selection_failed"
                     try:
-                        selected_radio.dispatch_event("change")
-                        selected_radio.dispatch_event("input")
+                        err_screenshot = SCREENSHOTS_DIR / f"error_mode_{accommodation_id}_{int(time.time())}.png"
+                        page.screenshot(path=str(err_screenshot), full_page=True)
+                        result["screenshot_path"] = str(err_screenshot)
                     except Exception:
                         pass
-                    page.wait_for_timeout(500)
-                    logger.info(f"Selected occupation mode radio: {r_id} (checked={selected_radio.is_checked()})")
+                    return result
 
-            mode_select = page.locator("select[name*='occupationMode'], select#ModalitiesForm-occupationMode").first
-            if mode_select.is_visible():
-                options = mode_select.locator("option").all_inner_texts()
-                logger.info(f"Occupation mode dropdown options found: {options}")
-                target_value = None
-                for opt in options:
-                    opt_l = opt.lower()
-                    if target_mode == "single" and ("seul" in opt_l or "indiv" in opt_l):
-                        target_value = opt.strip()
-                        break
-                    elif target_mode == "colocation" and "coloc" in opt_l:
-                        target_value = opt.strip()
-                        break
-                if not target_value:
-                    for opt in options:
-                        opt_l = opt.lower()
-                        if "seul" in opt_l or "indiv" in opt_l:
-                            target_value = opt.strip()
-                            break
-                if not target_value and len(options) > 1:
-                    target_value = options[1].strip()
+                selected_radio = radios[idx]
+                r_id = radio_ids[idx]
+                label_el = page.locator(f"label[for='{r_id}']").first if r_id else None
+                if label_el and label_el.count() > 0:
+                    label_el.click()
+                selected_radio.check(force=True)
+                try:
+                    selected_radio.dispatch_event("change")
+                    selected_radio.dispatch_event("input")
+                except Exception:
+                    pass
+                page.wait_for_timeout(500)
+                logger.info(f"Selected occupation mode radio: {r_id} (checked={selected_radio.is_checked()})")
+                mode_selected = True
 
-                if target_value:
+            if not mode_selected:
+                mode_select = page.locator("select[name*='occupationMode'], select#ModalitiesForm-occupationMode").first
+                if mode_select.is_visible():
+                    options = mode_select.locator("option").all_inner_texts()
+                    logger.info(f"Occupation mode dropdown options found: {options}")
+                    idx = _pick_mode_index([o.lower() for o in options], target_mode)
+                    if idx is None:
+                        err = (f"No dropdown option matches requested mode '{target_mode}' "
+                               f"(found options: {options}); refusing to guess.")
+                        logger.error(err)
+                        result["error"] = err
+                        result["step"] = "mode_selection_failed"
+                        try:
+                            err_screenshot = SCREENSHOTS_DIR / f"error_mode_{accommodation_id}_{int(time.time())}.png"
+                            page.screenshot(path=str(err_screenshot), full_page=True)
+                            result["screenshot_path"] = str(err_screenshot)
+                        except Exception:
+                            pass
+                        return result
+                    target_value = options[idx].strip()
                     mode_select.select_option(label=target_value)
                     logger.info(f"Selected occupation mode dropdown: {target_value}")
 
@@ -395,8 +441,13 @@ def _apply_for_accommodation_core(
                     try:
                         study_select.select_option(value=STUDY_LEVEL)
                         logger.info(f"Selected study level value: {STUDY_LEVEL}")
-                    except Exception:
-                        pass
+                    except Exception as study_err:
+                        logger.warning(
+                            f"Could not select a study level (no 'Master' option and "
+                            f"STUDY_LEVEL='{STUDY_LEVEL}' didn't match any option value: "
+                            f"{study_err}). Proceeding without setting it -- this listing may "
+                            f"have eligibility requirements that go unmet as a result."
+                        )
 
             # Checkboxes: taxesInFrance & alreadyAccommodated
             if TAXES_IN_FRANCE:
@@ -561,6 +612,7 @@ def apply_for_accommodation(
     alerting via Telegram if unsuccessful.
     """
     target_url = f"https://trouverunlogement.lescrous.fr/tools/{tool_id}/cart/requests/create/{accommodation_id}"
+    _prune_old_screenshots()
     result = None
     try:
         result = _apply_for_accommodation_core(
