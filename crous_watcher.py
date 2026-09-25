@@ -607,38 +607,82 @@ def append_run_history(status: str, summary: str) -> None:
 # CROUS API Scraper Engine
 # ==============================================================================
 
+# Cache for discover_tool_ids(): the homepage used to be re-fetched every
+# single cycle with no retry and no proxy rotation, and any failure (network
+# blip, rate limit, etc.) silently fell back to a hardcoded tool ID with no
+# alert. Now it's checked at most once per TOOL_ID_REFRESH_INTERVAL_SEC, with
+# the same proxy-retry pattern fetch_all_crous_listings() uses, and it only
+# falls back to the hardcoded default (loudly, via Telegram) if there's no
+# previously-known-good list to fall back to instead.
+_TOOL_IDS_CACHE = {"ids": None, "checked_at": 0.0}
+TOOL_ID_REFRESH_INTERVAL_SEC = 3600
+TOOL_ID_MAX_PROXY_RETRIES = 3
+
+
 def discover_tool_ids() -> list[str]:
-    """Dynamically discover active tool IDs from the CROUS homepage using proxy."""
+    """Discover active tool IDs from the CROUS homepage, with caching and proxy retry/rotation."""
+    now = time.time()
+    if _TOOL_IDS_CACHE["ids"] is not None and (now - _TOOL_IDS_CACHE["checked_at"]) < TOOL_ID_REFRESH_INTERVAL_SEC:
+        return _TOOL_IDS_CACHE["ids"]
+
     url = "https://trouverunlogement.lescrous.fr/"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
     }
-    proxy_url = None
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        opener, proxy_url = get_crous_opener_and_proxy(rotate=False)
-        with opener.open(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-            if activity_logger:
-                activity_logger.log_scouter_attempt(proxy_url, url, success=True, next_run="2-3 seconds")
+
+    last_error = "No /tools/<id> pattern found on homepage."
+    for attempt in range(TOOL_ID_MAX_PROXY_RETRIES):
+        proxy_url = None
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            opener, proxy_url = get_crous_opener_and_proxy(rotate=False)
+            with opener.open(req, timeout=10) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
             import re
             found = set(re.findall(r"/tools/(\d+)", html))
             if found:
-                return sorted(list(found))
-    except AllProxyGroupsExhaustedError:
-        raise
-    except Exception as err:
-        if activity_logger:
-            activity_logger.log_scouter_attempt(
-                proxy_url,
-                url,
-                success=False,
-                error_message=f"Découverte d'outils échouée : {err}",
-                next_run="2-3 seconds"
-            )
-        logger.debug(f"Tool discovery fallback: {err}")
+                ids = sorted(list(found))
+                _TOOL_IDS_CACHE["ids"] = ids
+                _TOOL_IDS_CACHE["checked_at"] = now
+                if activity_logger:
+                    activity_logger.log_scouter_attempt(proxy_url, url, success=True, next_run="2-3 seconds")
+                return ids
+        except AllProxyGroupsExhaustedError:
+            raise
+        except Exception as err:
+            last_error = err
+            is_last_attempt = attempt >= TOOL_ID_MAX_PROXY_RETRIES - 1
+            if activity_logger:
+                activity_logger.log_scouter_attempt(
+                    proxy_url,
+                    url,
+                    success=False,
+                    error_message=f"Découverte d'outils échouée : {err}",
+                    next_run=get_next_run_estimate() if is_last_attempt else "2-3 seconds"
+                )
+            logger.warning(f"Tool discovery attempt {attempt + 1}/{TOOL_ID_MAX_PROXY_RETRIES} failed: {err}")
 
-    # Default fallback
+        if attempt < TOOL_ID_MAX_PROXY_RETRIES - 1 and proxy_manager:
+            proxy_manager.rotate_proxy(skip_exhausted=True)
+
+    # All retries failed.
+    if _TOOL_IDS_CACHE["ids"] is not None:
+        logger.warning(
+            f"Tool discovery failed after {TOOL_ID_MAX_PROXY_RETRIES} attempts; "
+            f"reusing last known tool IDs {_TOOL_IDS_CACHE['ids']}: {last_error}"
+        )
+        return _TOOL_IDS_CACHE["ids"]
+
+    logger.error(
+        f"Tool discovery failed after {TOOL_ID_MAX_PROXY_RETRIES} attempts and no cached value "
+        f"exists; falling back to default tool ID 47: {last_error}"
+    )
+    send_telegram_message(
+        "⚠️ *[Alerte Scouter : Découverte d'outils échouée]*\n\n"
+        f"Impossible de découvrir les outils actifs après {TOOL_ID_MAX_PROXY_RETRIES} tentatives.\n"
+        f"Dernière erreur : `{str(last_error)[:200]}`\n"
+        "Utilisation de l'ID par défaut (47) en secours."
+    )
     return ["47"]
 
 
