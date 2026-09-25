@@ -812,6 +812,21 @@ def discover_tool_ids() -> list[str]:
     return ["47"]
 
 
+def discover_tool_ids_with_fetch_flag() -> tuple[list[str], bool]:
+    """
+    Like discover_tool_ids(), but also reports whether a real homepage fetch just
+    happened (cache miss, at most once per hour) vs. a cache hit (the vast majority
+    of cycles). Lets callers skip pacing delays that only make sense right after a
+    real request -- e.g. check_and_notify()'s "natural delay between homepage check
+    and search requests" used to fire every single cycle even when the homepage
+    wasn't actually touched that cycle, once discover_tool_ids() started caching.
+    """
+    checked_at_before = _TOOL_IDS_CACHE.get("checked_at", 0.0)
+    tool_ids = discover_tool_ids()
+    did_real_fetch = _TOOL_IDS_CACHE.get("checked_at", 0.0) != checked_at_before
+    return tool_ids, did_real_fetch
+
+
 def fetch_all_crous_listings(tool_id: str) -> list[dict]:
     """
     Fetch all active listings for the given tool_id via the internal search REST API.
@@ -997,8 +1012,13 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
             break
 
         page += 1
-        # Human-like delay between pages (random 2 to 3 seconds)
-        time.sleep(random.uniform(2.0, 3.0))
+        # Delay between pages -- tightened 2026-09-25 from 2.0-3.0s to 1.0-1.5s after a
+        # live test against the real endpoint: 9/9 clean requests at both 1.5s and 1.0s
+        # spacing, but a failure appeared at 0.5s (a fast ~1.1s URLError, not a timeout --
+        # possibly CROUS actively rejecting, not just proxy noise). 1.0-1.5s is the
+        # tightest interval that came back fully clean; do not push below this without
+        # re-testing.
+        time.sleep(random.uniform(1.0, 1.5))
 
     return all_items
 
@@ -1191,9 +1211,14 @@ def check_and_notify() -> tuple[int, int]:
                 f"Scouter operating with only ONE healthy proxy group remaining: {available_groups[0]}"
             )
 
-    tool_ids = discover_tool_ids()
-    # Natural delay between homepage check and search requests (random 2 to 3 seconds)
-    time.sleep(random.uniform(2.0, 3.0))
+    tool_ids, tool_ids_did_real_fetch = discover_tool_ids_with_fetch_flag()
+    if tool_ids_did_real_fetch:
+        # Natural delay between homepage check and search requests (random 2 to 3
+        # seconds) -- only applies when discover_tool_ids() actually just hit the
+        # homepage (cache miss, at most once per hour). On a cache hit (the vast
+        # majority of cycles) there was no real homepage request to space out from,
+        # so skip the delay entirely rather than pad every single cycle for nothing.
+        time.sleep(random.uniform(2.0, 3.0))
 
     all_raw_items = []
     errors_encountered = []
