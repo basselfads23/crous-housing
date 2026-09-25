@@ -240,14 +240,32 @@ def rotate_proxy(skip_exhausted: bool = True) -> str | None:
     return get_current_proxy(rotate=True, skip_exhausted=skip_exhausted)
 
 
+def _sniper_candidate_list() -> list[str]:
+    """
+    Proxy ordering shared by get_sniper_proxy() and rotate_sniper_proxy(), so the
+    same stored index always refers to the same proxy in both functions. Webshare
+    proxies first (they support both CROUS and .gouv.fr auth), Oxylabs last.
+
+    These two functions used to index into two DIFFERENT orderings (this
+    Webshare-first order vs. load_proxies()' raw file order) while sharing the
+    same stored index -- meaning a rotation triggered by a 429 could land on
+    essentially an arbitrary proxy, including possibly the one that just got
+    rate-limited, wasting a request for nothing.
+    """
+    proxies = load_proxies()
+    webshare_proxies = [p for p in proxies if "oxylabs" not in p]
+    oxylabs_proxies = [p for p in proxies if "oxylabs" in p]
+    return webshare_proxies + oxylabs_proxies
+
+
 def rotate_sniper_proxy() -> dict | None:
     """Explicitly advances to the next sniper proxy and returns it."""
-    proxies = load_proxies()
-    if not proxies:
+    candidate_list = _sniper_candidate_list()
+    if not candidate_list:
         return None
-    idx = (_get_sniper_stored_index() + 1) % len(proxies)
+    idx = (_get_sniper_stored_index() + 1) % len(candidate_list)
     _save_sniper_stored_index(idx)
-    return get_playwright_proxy(proxy_url=proxies[idx])
+    return get_playwright_proxy(proxy_url=candidate_list[idx])
 
 
 def get_sniper_proxy() -> dict | None:
@@ -260,13 +278,7 @@ def get_sniper_proxy() -> dict | None:
     if sniper_proxy_url:
         return get_playwright_proxy(proxy_url=sniper_proxy_url)
 
-    proxies = load_proxies()
-    if not proxies:
-        return None
-
-    # Check Webshare proxies first (they support both CROUS and .gouv.fr auth)
-    webshare_proxies = [p for p in proxies if "oxylabs" not in p]
-    candidate_list = webshare_proxies + [p for p in proxies if "oxylabs" in p]
+    candidate_list = _sniper_candidate_list()
     if not candidate_list:
         return None
 
