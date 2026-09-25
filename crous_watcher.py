@@ -88,13 +88,14 @@ NIGHT_CHECK_INTERVAL_SECONDS = int(os.getenv("NIGHT_CHECK_INTERVAL_SECONDS", "24
 # Automated Application (Sniper) Configuration
 # Individual-only, price/surface tiered (colocation is never auto-applied, always
 # alert-only). Anchored on real Marseille listings from 2026-09-25: a 255e/12m2 and
-# a 284.82e/19m2 T1 were both judged "snipe immediately" deals, while a 350e/14m2
-# room was judged "not a good enough deal at that size" and deliberately excluded.
+# a 284.82e/19m2 T1 were both judged "snipe immediately" deals. A third tier
+# (300-350e, >19m2) existed briefly but was removed the same day -- too loose to
+# trust unattended; that price band is alert-only now, with the manual Snipe
+# button as the override for anything in it worth grabbing.
 AUTO_APPLY_ENABLED = os.getenv("AUTO_APPLY_ENABLED", "true").lower() in ("true", "1", "yes")
 AUTO_APPLY_DRY_RUN = os.getenv("AUTO_APPLY_DRY_RUN", "true").lower() in ("true", "1", "yes")
 AUTO_APPLY_CHEAP_MAX_PRICE = float(os.getenv("AUTO_APPLY_CHEAP_MAX_PRICE", "250"))
 AUTO_APPLY_MID_MAX_PRICE = float(os.getenv("AUTO_APPLY_MID_MAX_PRICE", "300"))
-AUTO_APPLY_SINGLE_MAX_PRICE = float(os.getenv("AUTO_APPLY_SINGLE_MAX_PRICE", "350"))
 AUTO_APPLY_MID_MIN_SURFACE_M2 = float(os.getenv("AUTO_APPLY_MID_MIN_SURFACE_M2", "12"))
 AUTO_APPLY_MID_MAX_SURFACE_M2 = float(os.getenv("AUTO_APPLY_MID_MAX_SURFACE_M2", "19"))
 
@@ -110,9 +111,8 @@ def _format_sniper_rules_text() -> str:
         f"⚡ *Sniper < {AUTO_APPLY_CHEAP_MAX_PRICE:.0f} € :* Individuel, toute surface ({mode_tag})\n"
         f"🎯 *Sniper {AUTO_APPLY_CHEAP_MAX_PRICE:.0f}–{AUTO_APPLY_MID_MAX_PRICE:.0f} € :* Individuel, "
         f"{AUTO_APPLY_MID_MIN_SURFACE_M2:.0f}–{AUTO_APPLY_MID_MAX_SURFACE_M2:.0f} m² ({mode_tag})\n"
-        f"🎯 *Sniper {AUTO_APPLY_MID_MAX_PRICE:.0f}–{AUTO_APPLY_SINGLE_MAX_PRICE:.0f} € :* Individuel, "
-        f"> {AUTO_APPLY_MID_MAX_SURFACE_M2:.0f} m² ({mode_tag})\n"
-        f"📢 *Alerte seule :* Colocation (toujours), Individuel {AUTO_APPLY_SINGLE_MAX_PRICE:.0f}–{MAX_PRICE:.0f} €"
+        f"📢 *Alerte seule (+ bouton Snipe manuel) :* Colocation (toujours), "
+        f"Individuel {AUTO_APPLY_MID_MAX_PRICE:.0f}–{MAX_PRICE:.0f} €"
     )
 
 
@@ -1174,9 +1174,10 @@ def is_target_listing(item: dict) -> tuple[bool, dict]:
     - AUTO_APPLY_CHEAP_MAX_PRICE <= rent <= AUTO_APPLY_MID_MAX_PRICE (250-300€) ->
       Snipe only if surface is between AUTO_APPLY_MID_MIN_SURFACE_M2 and
       AUTO_APPLY_MID_MAX_SURFACE_M2 (12-19 m²), inclusive.
-    - AUTO_APPLY_MID_MAX_PRICE < rent <= AUTO_APPLY_SINGLE_MAX_PRICE (300-350€) ->
-      Snipe only if surface > AUTO_APPLY_MID_MAX_SURFACE_M2 (19 m²).
-    - Anything else within MAX_PRICE (400€) -> Alert only via Telegram, do NOT auto-apply.
+    - Anything else within MAX_PRICE (400€) -> Alert only via Telegram, do NOT
+      auto-apply (a manual Snipe button is offered instead). A third tier
+      (300-350€, >19m²) existed briefly but was removed 2026-09-25 as too loose
+      to trust unattended.
     - rent > MAX_PRICE (400€) -> Discard completely.
     Returns (matches, parsed_info_dict).
     """
@@ -1269,8 +1270,9 @@ def is_target_listing(item: dict) -> tuple[bool, dict]:
                 surface_val is not None
                 and AUTO_APPLY_MID_MIN_SURFACE_M2 <= surface_val <= AUTO_APPLY_MID_MAX_SURFACE_M2
             )
-        elif AUTO_APPLY_MID_MAX_PRICE < x <= AUTO_APPLY_SINGLE_MAX_PRICE:
-            should_auto_apply = surface_val is not None and surface_val > AUTO_APPLY_MID_MAX_SURFACE_M2
+        # Third tier (AUTO_APPLY_MID_MAX_PRICE < x <= 350e, surface > 19m2) removed
+        # 2026-09-25 -- too loose to trust unattended. That band is alert-only now;
+        # the manual Snipe button covers anything in it worth grabbing.
 
         if should_auto_apply:
             chosen_mode = "single"

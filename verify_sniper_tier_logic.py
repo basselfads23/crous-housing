@@ -1,11 +1,12 @@
 """
 verify_sniper_tier_logic.py — run with: venv/bin/python3 verify_sniper_tier_logic.py
 
-Verifies the new price/surface-tiered auto-apply trigger in is_target_listing():
+Verifies the price/surface-tiered auto-apply trigger in is_target_listing():
   - rent < 250e            -> snipe (individual), any surface
   - 250e <= rent <= 300e   -> snipe only if 12-19 m2 (inclusive)
-  - 300e <  rent <= 350e   -> snipe only if > 19 m2
-  - anything else          -> alert only, never auto-applied
+  - rent > 300e            -> alert only, NEVER auto-applied (the third tier,
+    300-350e/>19m2, existed briefly but was removed 2026-09-25 as too loose to
+    trust unattended -- the manual Snipe button covers this band instead)
   - colocation             -> NEVER auto-applied, alert only, regardless of price
   - AUTO_APPLY_ENABLED=False -> never auto-applied regardless of price/surface
   - missing surface data at a price that needs a surface check -> fails safe
@@ -13,7 +14,8 @@ Verifies the new price/surface-tiered auto-apply trigger in is_target_listing():
 
 Includes the three real listings from this week's Telegram alerts as anchor
 cases: Alice Chatenoud (284.82e/19m2) and Gaston Berger (255e/12m2) should both
-now trigger; Luminy (350e/14m2) should still not.
+trigger; Luminy (350e/14m2) should not (never did, and now the whole 300-350e
+band doesn't auto-apply at all regardless of surface).
 
 Read-only / no network.
 """
@@ -101,25 +103,36 @@ class TestSniperTierLogic(unittest.TestCase):
         _, info = crous_watcher.is_target_listing(make_item(280.0, None))
         self.assertFalse(info["should_auto_apply"])
 
-    def test_upper_band_300_to_350_snipes_above_19(self):
+    def test_above_300_never_snipes_even_with_large_surface(self):
+        # The third tier (300-350e, >19m2) was removed 2026-09-25 -- this band is
+        # alert-only now regardless of surface, no matter how good the deal looks.
         _, info = crous_watcher.is_target_listing(make_item(320.0, 25.0))
-        self.assertTrue(info["should_auto_apply"])
+        self.assertFalse(info["should_auto_apply"])
 
-    def test_upper_band_boundary_350_inclusive(self):
+    def test_above_300_never_snipes_at_350_with_large_surface(self):
         _, info = crous_watcher.is_target_listing(make_item(350.0, 30.0))
-        self.assertTrue(info["should_auto_apply"])
+        self.assertFalse(info["should_auto_apply"])
 
-    def test_upper_band_rejects_surface_19_or_below(self):
+    def test_above_300_never_snipes_small_surface_either(self):
         _, info = crous_watcher.is_target_listing(make_item(320.0, 19.0))
         self.assertFalse(info["should_auto_apply"])
 
-    def test_upper_band_missing_surface_fails_safe_no_snipe(self):
+    def test_above_300_never_snipes_missing_surface(self):
         _, info = crous_watcher.is_target_listing(make_item(320.0, None))
         self.assertFalse(info["should_auto_apply"])
 
-    def test_above_350_never_snipes(self):
-        _, info = crous_watcher.is_target_listing(make_item(360.0, 100.0))
+    def test_380_never_snipes_but_still_alerts(self):
+        # Within alert range (<= MAX_PRICE, 400e) but well above the auto-snipe
+        # ceiling (300e) -- should still match (so a manual Snipe button is
+        # offered) but never auto-apply.
+        matches, info = crous_watcher.is_target_listing(make_item(380.0, 100.0))
+        self.assertTrue(matches)
         self.assertFalse(info["should_auto_apply"])
+
+    def test_above_400_is_discarded_entirely(self):
+        matches, info = crous_watcher.is_target_listing(make_item(410.0, 100.0))
+        self.assertFalse(matches)
+        self.assertEqual(info, {})
 
     def test_colocation_never_auto_applies_even_when_cheap(self):
         _, info = crous_watcher.is_target_listing(make_item(200.0, 15.0, mode_type="house_sharing", label="T5 Colocation"))
