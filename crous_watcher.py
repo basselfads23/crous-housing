@@ -34,6 +34,8 @@ STATE_FILE = BASE_DIR / "listings_seen.json"
 HISTORY_LOG_FILE = BASE_DIR / "run_history.log"
 LOG_FILE = BASE_DIR / "watcher.log"
 LISTINGS_DATA_FILE = BASE_DIR / "marseille_listings_data.jsonl"
+NATIONWIDE_SEEN_FILE = BASE_DIR / "nationwide_seen_ids.json"
+POSTING_ACTIVITY_FILE = BASE_DIR / "posting_activity.json"
 
 # Fix Windows console UTF-8 output
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -187,27 +189,6 @@ try:
 except Exception:
     from datetime import timedelta
     PARIS_TZ = timezone(timedelta(hours=2))
-
-
-# One-time weekend bandwidth-conservation pause, agreed 2026-09-25: Webshare proxies
-# are on a 1GB bandwidth cap likely to run out before Monday's decision on whether to
-# buy more, and CROUS is assumed quiet on Sundays. This is a deliberate, time-boxed
-# FULL STOP of the automatic polling loop -- distinct from the permanent night/day
-# throttling feature (not built, and explicitly throttle-only / never-hard-stop per
-# the engineering handoff), which still needs real activity-logging data before it
-# can be designed. Telegram commands (/status, /check, /resume) keep working during
-# the pause so this can be manually overridden, and it self-expires after Monday
-# 2026-09-28 06:00 Paris time -- nothing to remember to remove later.
-WEEKEND_PAUSE_WINDOWS_PARIS = [
-    (datetime(2026, 9, 25, 0, 0, tzinfo=PARIS_TZ), datetime(2026, 9, 26, 6, 0, tzinfo=PARIS_TZ)),
-    (datetime(2026, 9, 26, 14, 0, tzinfo=PARIS_TZ), datetime(2026, 9, 28, 6, 0, tzinfo=PARIS_TZ)),
-]
-
-
-def in_weekend_pause_window(now_paris: datetime = None) -> bool:
-    """True while automatic polling should be fully paused for the weekend."""
-    now_paris = now_paris or datetime.now(PARIS_TZ)
-    return any(start <= now_paris < end for start, end in WEEKEND_PAUSE_WINDOWS_PARIS)
 
 
 def get_smart_cadence() -> tuple[int, str]:
@@ -447,14 +428,8 @@ def handle_telegram_command(cmd: str, on_check_callback=None):
         else:
             proxy_display = current_proxy.split("@")[-1] if "@" in current_proxy else current_proxy
 
-        in_weekend_pause = in_weekend_pause_window()
-        header_icon = "⏸️" if (PAUSED or in_weekend_pause) else "🟢"
-        if PAUSED:
-            header_text = "CROUS Watcher en PAUSE (Tapez /resume)"
-        elif in_weekend_pause:
-            header_text = "CROUS Watcher en PAUSE week-end (reprise 06h00 Paris)"
-        else:
-            header_text = "CROUS Watcher Actif (24/7)"
+        header_icon = "⏸️" if PAUSED else "🟢"
+        header_text = "CROUS Watcher en PAUSE (Tapez /resume)" if PAUSED else "CROUS Watcher Actif (24/7)"
 
         status_text = (
             f"{header_icon} *{header_text}*\n\n"
@@ -684,6 +659,74 @@ def record_marseille_listing(info: dict, tool_id: str, listing_url: str) -> None
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as err:
         logger.error(f"Failed to record listing data: {err}")
+
+
+def load_nationwide_seen_ids() -> set:
+    """IDs of every listing ever seen nationwide (any city), for posting-activity tracking."""
+    if not NATIONWIDE_SEEN_FILE.exists():
+        return set()
+    try:
+        return set(json.loads(NATIONWIDE_SEEN_FILE.read_text(encoding="utf-8")))
+    except Exception as err:
+        logger.warning(f"Error reading {NATIONWIDE_SEEN_FILE}: {err}. Resetting.")
+        return set()
+
+
+def save_nationwide_seen_ids(ids: set) -> None:
+    """Save atomically using a temporary file, same pattern as save_state()."""
+    temp_file = NATIONWIDE_SEEN_FILE.with_suffix(".tmp")
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(sorted(ids), f)
+        temp_file.replace(NATIONWIDE_SEEN_FILE)
+    except Exception as err:
+        logger.error(f"Failed to save {NATIONWIDE_SEEN_FILE}: {err}")
+
+
+def record_posting_activity(nationwide_new_count: int, marseille_new_count: int) -> None:
+    """
+    Updates today's (Paris-local calendar date) first-seen/last-seen timestamp and
+    count of newly-detected listings, tracked separately for nationwide (all of
+    France) and Marseille. Goal: build a real, data-driven picture of when CROUS
+    actually posts new listings (start/stop hours, weekday patterns), instead of
+    the untested "quiet at night/on Sundays" assumption the smart-cadence feature
+    currently runs on -- eventually used to widen/tune the "peak hours" cadence
+    window with evidence instead of a guess.
+
+    No-op (no write at all) when nothing new was seen this cycle, since
+    check_and_notify() runs frequently and most cycles find nothing new.
+    """
+    if nationwide_new_count <= 0 and marseille_new_count <= 0:
+        return
+    now_paris = datetime.now(PARIS_TZ)
+    ts_iso = now_paris.isoformat()
+    day_key = now_paris.strftime("%Y-%m-%d")
+
+    data = {}
+    if POSTING_ACTIVITY_FILE.exists():
+        try:
+            data = json.loads(POSTING_ACTIVITY_FILE.read_text(encoding="utf-8"))
+        except Exception as err:
+            logger.warning(f"Error reading {POSTING_ACTIVITY_FILE}: {err}. Resetting.")
+            data = {}
+
+    day = data.setdefault(day_key, {})
+    for scope, new_count in (("nationwide", nationwide_new_count), ("marseille", marseille_new_count)):
+        if new_count <= 0:
+            continue
+        first_key, last_key, count_key = f"{scope}_first_seen", f"{scope}_last_seen", f"{scope}_count"
+        if first_key not in day:
+            day[first_key] = ts_iso
+        day[last_key] = ts_iso
+        day[count_key] = day.get(count_key, 0) + new_count
+
+    temp_file = POSTING_ACTIVITY_FILE.with_suffix(".tmp")
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        temp_file.replace(POSTING_ACTIVITY_FILE)
+    except Exception as err:
+        logger.error(f"Failed to save {POSTING_ACTIVITY_FILE}: {err}")
 
 
 # ==============================================================================
@@ -1133,6 +1176,9 @@ def check_and_notify() -> tuple[int, int]:
     3. Triggers immediate auto-apply if rent <= AUTO_APPLY_MAX_PRICE (330€).
     4. Sends Telegram alert (with sniper screenshot if applied, or manual link if 330-400€).
     5. Updates listings_seen.json.
+    6. Records posting-activity stats (first/last new listing seen today, nationwide
+       and Marseille) to posting_activity.json, for eventually tuning smart-cadence
+       "peak hours" against real data instead of an assumption.
     Returns (total_matching_in_marseille, new_alerts_sent).
     """
     state = load_state()
@@ -1184,6 +1230,15 @@ def check_and_notify() -> tuple[int, int]:
     METRICS["last_active_listings_count"] = len(all_raw_items)
     METRICS["last_check_time"] = datetime.now(timezone.utc)
     METRICS["total_checks"] += 1
+
+    # Nationwide (any city) new-listing detection, for posting-activity tracking --
+    # separate from the Marseille-only seen_ids/alerting logic below.
+    nationwide_seen = load_nationwide_seen_ids()
+    nationwide_new_ids = {
+        str(it.get("id", "")) for it in all_raw_items if str(it.get("id", "")) and str(it.get("id", "")) not in nationwide_seen
+    }
+    if nationwide_new_ids:
+        save_nationwide_seen_ids(nationwide_seen | nationwide_new_ids)
 
     matching_listings = []
     new_alerts_sent = 0
@@ -1300,6 +1355,8 @@ def check_and_notify() -> tuple[int, int]:
     state["consecutive_failures"] = 0
     save_state(state)
 
+    record_posting_activity(len(nationwide_new_ids), new_alerts_sent)
+
     summary = (
         f"Check completed: {len(all_raw_items)} in France | "
         f"{len(matching_listings)} in Marseille | "
@@ -1400,22 +1457,16 @@ def main_loop():
 
     state = load_state()
     last_heartbeat_day = None
-    was_in_weekend_pause = in_weekend_pause_window()
 
     # Send startup announcement to Telegram
     is_logged_in, _ = is_session_valid()
-    pause_notice = (
-        "\n⏸️ *Pause automatique du week-end active* -- surveillance suspendue "
-        "jusqu'à 06h00 (Paris). Tapez `/check` pour une vérification manuelle.\n"
-    ) if was_in_weekend_pause else ""
     startup_msg = (
         "🚀 *CROUS Watcher Démarré sur votre VPS !*\n\n"
         f"🎯 *Ville :* {TARGET_CITY.capitalize()}\n"
         f"🤖 *Auto-Apply :* {'Activé' if AUTO_APPLY_ENABLED else 'Désactivé'}\n"
         f"{_format_sniper_rules_text()}\n"
         f"⏱️ *Cadence actuelle :* ~{cur_interval}s ({cur_cadence})\n"
-        f"🔐 *Session CROUS :* {'Active ✅' if is_logged_in else 'Non configurée / Expirée ❌'}\n"
-        f"{pause_notice}\n"
+        f"🔐 *Session CROUS :* {'Active ✅' if is_logged_in else 'Non configurée / Expirée ❌'}\n\n"
         "Je surveille en continu 24h/24. Envoyez `/status` pour voir les métriques ou `/check` pour vérifier."
     )
     broadcast_telegram_message(startup_msg)
@@ -1426,23 +1477,7 @@ def main_loop():
         # 1. Check for incoming Telegram commands (/status, /check, /test, /session, /renew, /test_apply, /pause, /resume)
         poll_telegram_updates(on_check_callback=check_and_notify)
 
-        now_in_weekend_pause = in_weekend_pause_window()
-        if now_in_weekend_pause != was_in_weekend_pause:
-            was_in_weekend_pause = now_in_weekend_pause
-            if now_in_weekend_pause:
-                send_telegram_message(
-                    "⏸️ *Pause automatique du week-end activée*\n\n"
-                    "Surveillance automatique suspendue pour préserver la bande passante des proxys.\n"
-                    "Reprise automatique prévue à 06h00 (heure de Paris).\n"
-                    "Tapez `/check` pour une vérification manuelle malgré tout."
-                )
-            else:
-                send_telegram_message(
-                    "▶️ *Pause automatique du week-end terminée*\n\n"
-                    "La surveillance 24/7 a repris normalement."
-                )
-
-        if PAUSED or now_in_weekend_pause:
+        if PAUSED:
             time.sleep(1)
             continue
 
