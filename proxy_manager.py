@@ -21,6 +21,13 @@ RESIDENTIAL_PROXIES_FILE = BASE_DIR / "proxies_residential.txt"
 EXHAUSTED_GROUPS_FILE = BASE_DIR / ".exhausted_proxy_groups.json"
 EXHAUSTION_TTL_SECONDS = 24 * 3600  # 24 hours
 
+# Per-proxy quarantine ("bench") for the SCOUTER's datacenter pool only. Complements the
+# per-ACCOUNT exhaustion above (which can't help here: 191 proxies share one account).
+QUARANTINE_FILE = BASE_DIR / ".proxy_quarantine.json"
+PROXY_STRIKE_LIMIT = 3               # consecutive proxy-specific failures before a proxy is benched
+QUARANTINE_TTL_SECONDS = 24 * 3600   # bench duration; afterwards the proxy gets ONE more chance
+QUARANTINE_MAX_FRACTION = 0.25       # never bench more than this share of the pool
+
 
 _CURRENT_INDEX = 0
 
@@ -235,10 +242,144 @@ def mark_group_exhausted(group: str, reason: str = "402 Payment Required") -> bo
     return is_new
 
 
+def proxy_key(proxy_url: str | None) -> str | None:
+    """host:port only -- never credentials (this key is written to disk and shown in alerts)."""
+    if not proxy_url:
+        return None
+    u = urlsplit(proxy_url)
+    if not u.hostname:
+        return None
+    return f"{u.hostname}:{u.port}" if u.port else u.hostname
+
+
+def _read_quarantine_state() -> dict:
+    """
+    Raw quarantine state {host:port: {"strikes": int, "quarantined_at": float | None, ...}}.
+    Fails OPEN: any read/parse problem returns {} (nothing benched), so a corrupt or
+    missing file can never shrink the pool or blind the scouter.
+    """
+    if not QUARANTINE_FILE.exists():
+        return {}
+    try:
+        content = QUARANTINE_FILE.read_text(encoding="utf-8").strip()
+        if not content:
+            return {}
+        data = json.loads(content)
+        if not isinstance(data, dict):
+            return {}
+        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, dict)}
+    except Exception as e:
+        logger.warning(f"Failed to read proxy quarantine state (treating as empty): {e}")
+        return {}
+
+
+def _write_quarantine_state(state: dict) -> None:
+    temp_file = QUARANTINE_FILE.with_suffix(".tmp")
+    try:
+        temp_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        temp_file.replace(QUARANTINE_FILE)
+    except Exception as e:
+        logger.error(f"Failed to write {QUARANTINE_FILE}: {e}")
+
+
+def get_quarantined_proxies() -> dict[str, dict]:
+    """
+    Currently benched proxies, {host:port: info}. Benches older than the 24h TTL are
+    lifted, but the proxy goes on probation (strikes = limit - 1): ONE further
+    proxy-specific failure re-benches it immediately, one success clears it fully.
+    Manual recovery: delete .proxy_quarantine.json.
+    """
+    state = _read_quarantine_state()
+    now = time.time()
+    active = {}
+    changed = False
+    for key, info in state.items():
+        quarantined_at = info.get("quarantined_at")
+        if quarantined_at is None:
+            continue
+        try:
+            age = now - float(quarantined_at)
+        except (TypeError, ValueError):
+            age = QUARANTINE_TTL_SECONDS  # unreadable timestamp -> treat as expired
+        if age < QUARANTINE_TTL_SECONDS:
+            active[key] = info
+        else:
+            info["quarantined_at"] = None
+            info["strikes"] = PROXY_STRIKE_LIMIT - 1
+            changed = True
+    if changed:
+        _write_quarantine_state(state)
+    return active
+
+
+def record_proxy_success(proxy_url: str | None) -> None:
+    """A proxy that just worked is healthy: forget any strikes/bench it had."""
+    key = proxy_key(proxy_url)
+    if not key:
+        return
+    state = _read_quarantine_state()
+    if key in state:
+        del state[key]
+        _write_quarantine_state(state)
+
+
+def record_proxy_strike(proxy_url: str | None, reason: str = "") -> dict:
+    """
+    Record one proxy-specific failure (the caller only calls this when a DIFFERENT proxy
+    then succeeded for the same request, so the fault is the proxy's, not a systemic
+    outage). Strikes are consecutive (record_proxy_success resets them) and persisted.
+
+    At PROXY_STRIKE_LIMIT the proxy is benched for QUARANTINE_TTL_SECONDS -- unless that
+    would bench more than QUARANTINE_MAX_FRACTION of the pool, in which case it is NOT
+    benched (blocked_by_floor) so this feature can never leave the scouter blind. With
+    a very small pool the cap rounds down to 0, i.e. the feature is inert (fail-safe).
+
+    Returns {"key", "strikes", "quarantined_now", "blocked_by_floor", "benched_count",
+    "pool_size"}.
+    """
+    key = proxy_key(proxy_url)
+    pool_size = len(load_proxies())
+    result = {"key": key, "strikes": 0, "quarantined_now": False, "blocked_by_floor": False,
+              "benched_count": 0, "pool_size": pool_size}
+    if not key:
+        return result
+
+    benched = get_quarantined_proxies()  # also applies TTL expiry before we read the state
+    result["benched_count"] = len(benched)
+    if key in benched:
+        result["strikes"] = int(benched[key].get("strikes", PROXY_STRIKE_LIMIT))
+        return result  # already benched -- nothing to add
+
+    state = _read_quarantine_state()
+    info = state.get(key, {})
+    try:
+        strikes = int(info.get("strikes", 0)) + 1
+    except (TypeError, ValueError):
+        strikes = 1
+    info["strikes"] = min(strikes, PROXY_STRIKE_LIMIT)
+    info["last_strike"] = datetime.now(timezone.utc).isoformat()
+    info["last_reason"] = (reason or "")[:200]
+    info.setdefault("quarantined_at", None)
+
+    if strikes >= PROXY_STRIKE_LIMIT:
+        if len(benched) >= int(pool_size * QUARANTINE_MAX_FRACTION):
+            result["blocked_by_floor"] = True
+        else:
+            info["quarantined_at"] = time.time()
+            result["quarantined_now"] = True
+            result["benched_count"] = len(benched) + 1
+
+    state[key] = info
+    _write_quarantine_state(state)
+    result["strikes"] = info["strikes"]
+    return result
+
+
 def get_current_proxy(rotate: bool = False, skip_exhausted: bool = True) -> str | None:
     """
     Get current active proxy URL, optionally rotating to next proxy in the list.
-    When skip_exhausted=True, proxies belonging to exhausted groups are excluded.
+    When skip_exhausted=True, proxies belonging to exhausted groups AND individually
+    quarantined proxies (see record_proxy_strike) are excluded.
     """
     proxies = load_proxies()
     if not proxies:
@@ -246,7 +387,11 @@ def get_current_proxy(rotate: bool = False, skip_exhausted: bool = True) -> str 
 
     if skip_exhausted:
         exhausted = get_exhausted_groups()
-        candidates = [p for p in proxies if get_proxy_group(p) not in exhausted]
+        benched = get_quarantined_proxies()
+        candidates = [
+            p for p in proxies
+            if get_proxy_group(p) not in exhausted and proxy_key(p) not in benched
+        ]
     else:
         candidates = proxies
 
