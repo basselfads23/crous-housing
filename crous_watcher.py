@@ -1000,6 +1000,51 @@ def discover_tool_ids_with_fetch_flag() -> tuple[list[str], bool]:
     return tool_ids, did_real_fetch
 
 
+def _settle_proxy_health(working_proxy: str | None, failed_proxies: list) -> None:
+    """
+    Per-proxy health bookkeeping for the scouter's datacenter pool (see
+    proxy_manager.record_proxy_strike). Called only after a request finally SUCCEEDED:
+    every proxy that failed earlier in that same request is blamed (a different proxy
+    just worked, so the fault is that proxy's, not an outage), and the working proxy's
+    strikes are cleared. If every attempt failed this is never called -- nobody gets
+    blamed for what may be a systemic outage. 402s never reach here (they're handled
+    per account by mark_group_exhausted). Never raises: bookkeeping must not break polling.
+    """
+    if not proxy_manager:
+        return
+    try:
+        proxy_manager.record_proxy_success(working_proxy)
+        working_key = proxy_manager.proxy_key(working_proxy)
+        blamed = set()
+        for failed_url, reason in failed_proxies:
+            failed_key = proxy_manager.proxy_key(failed_url)
+            if not failed_key or failed_key == working_key or failed_key in blamed:
+                continue
+            blamed.add(failed_key)
+            result = proxy_manager.record_proxy_strike(failed_url, reason)
+            safe_reason = str(reason).replace("`", "'")[:120]
+            if result["quarantined_now"]:
+                limit = proxy_manager.PROXY_STRIKE_LIMIT
+                logger.warning(f"Proxy {failed_key} benched for 24h after {limit} consecutive failures ({safe_reason})")
+                send_telegram_message(
+                    "🚫 *[Alerte Proxy - Proxy mis de côté]*\n\n"
+                    f"• *Proxy :* `{failed_key}`\n"
+                    f"• *Raison :* `{limit} échecs consécutifs (dernier : {safe_reason})`\n"
+                    f"• *Proxys non écartés :* {result['pool_size'] - result['benched_count']}/{result['pool_size']}\n"
+                    "• *Action :* Exclu du scouter pendant 24h, puis un dernier essai."
+                )
+            elif result["blocked_by_floor"]:
+                logger.warning(f"Proxy {failed_key} reached the strike limit but was NOT benched: quarantine cap reached")
+                if activity_logger:
+                    activity_logger.notify_general_error(
+                        "Mise de côté des proxys bloquée : la limite de 25 % du pool est atteinte, "
+                        "plus aucun proxy n'est écarté. Vérifiez les proxys du scouter.",
+                        component_name="Scouter"
+                    )
+    except Exception as err:
+        logger.warning(f"Proxy health bookkeeping failed (ignored, polling continues): {err}")
+
+
 def fetch_all_crous_listings(tool_id: str) -> list[dict]:
     """
     Fetch all active listings for the given tool_id via the internal search REST API.
@@ -1028,6 +1073,7 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
 
         data = None
         last_error = None
+        failed_proxies = []  # (proxy_url, reason) for each non-402 failure this request; see _settle_proxy_health
         for attempt in range(max_proxy_retries):
             opener, proxy_url = get_crous_opener_and_proxy(rotate=False)
             try:
@@ -1076,13 +1122,18 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
                     else:
                         raise
 
-                retry_str = "Retrying with next proxy..." if (attempt < max_proxy_retries - 1) else get_next_run_estimate()
+                is_final_attempt = attempt >= max_proxy_retries - 1
+                retry_str = get_next_run_estimate() if is_final_attempt else "Retrying with next proxy..."
+                failed_proxies.append((proxy_url, f"HTTP {http_err.code} ({http_err.reason})"))
                 if activity_logger:
+                    # Every failed attempt is still logged, but only the FINAL one pages the
+                    # owner: a failure that a retry on another proxy recovers from is counted
+                    # as a proxy strike instead (see _settle_proxy_health).
                     activity_logger.log_scouter_attempt(
                         proxy_url,
                         url,
                         success=False,
-                        error_message=f"HTTP {http_err.code} sur l'API CROUS ({http_err.reason})",
+                        error_message=(f"HTTP {http_err.code} sur l'API CROUS ({http_err.reason})" if is_final_attempt else None),
                         next_run=retry_str
                     )
                 if http_err.code in (403, 429):
@@ -1139,13 +1190,17 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
                     else:
                         raise
 
-                retry_str = "Retrying with next proxy..." if (attempt < max_proxy_retries - 1) else get_next_run_estimate()
+                is_final_attempt = attempt >= max_proxy_retries - 1
+                retry_str = get_next_run_estimate() if is_final_attempt else "Retrying with next proxy..."
+                failed_proxies.append((proxy_url, str(err)))
                 if activity_logger:
+                    # Same rule as the HTTPError branch above: log every attempt, alert only
+                    # when the request finally fails.
                     activity_logger.log_scouter_attempt(
                         proxy_url,
                         url,
                         success=False,
-                        error_message=f"Erreur réseau sur le proxy ({err})",
+                        error_message=(f"Erreur réseau sur le proxy ({err})" if is_final_attempt else None),
                         next_run=retry_str
                     )
                 if attempt < max_proxy_retries - 1 and proxy_manager:
@@ -1156,6 +1211,9 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
                     if "111" in err_str or "connection refused" in err_str.lower():
                         raise CrousBlockedOrRateLimitedError(code=111, message="Connection refused by CROUS firewall") from err
                     raise
+
+        if data is not None:
+            _settle_proxy_health(proxy_url, failed_proxies)
 
         if data is None:
             if last_error:
