@@ -9,10 +9,12 @@ A high-speed, intelligent Python daemon designed to run 24/7 on an Ubuntu VPS. I
 - **Ultra-Fast Polling with Zero Overhead:** Uses direct CROUS internal search APIs (~0.3s per check, ~20MB RAM) for continuous 24/7 monitoring.
 - **Automated Application (Sniper):** The split-second a new Marseille listing matches your criteria, a headless Playwright worker spawns using your pre-authenticated session, fills in the required form fields, and locks the room into your CROUS cart before anyone else can snipe it!
 - **Safe Dry-Run Testing:** Built-in dry-run safety toggle (`AUTO_APPLY_DRY_RUN=true`) that tests navigation, fills all fields, takes a full screenshot, and stops before the final submit button.
-- **Smart Time-Based Cadence:** Automatically adjusts polling speed based on French local time:
-  - **08:00 – 18:30 (Peak Office Hours):** Fast checks (every 30–40s) when CROUS staff publish rooms.
-  - **18:30 – 23:30 (Evening):** Moderate checks (every 60–75s).
-  - **23:30 – 08:00 (Night):** Sleep mode (every 4 mins) to cut request volume and protect your IP.
+- **Smart Time-Based Cadence:** Automatically adjusts polling speed based on French local time
+  (defaults below; the values below are live-tested down to these numbers with zero observed
+  errors — see `HANDOFF.md` before pushing them any tighter):
+  - **08:00 – 18:30 (Peak Office Hours):** Fast checks (every ~15s) when CROUS staff publish rooms.
+  - **18:30 – 23:30 (Evening):** Moderate checks (every ~65-75s).
+  - **23:30 – 08:00 (Night):** Sleep mode (every 4 mins) to cut request volume.
 - **Hardened Error & Ban Protection:** Detects HTTP 403 / 429 immediately, triggers instant priority Telegram alerts, and activates automatic safety backoff.
 - **Interactive Telegram Bot Commands:**
   - `/status` — View uptime, checks performed, current cadence, and session validity.
@@ -21,6 +23,11 @@ A high-speed, intelligent Python daemon designed to run 24/7 on an Ubuntu VPS. I
   - `/check` — Force an immediate search check right now.
   - `/test` — Send a test notification.
   - `/help` — Display command menu.
+  - **🎯 Snipe button:** every alert to the bot owner includes a manual "Snipe" button for
+    listings that didn't already qualify for auto-apply (e.g. outside the price/surface tiers
+    below, or colocation, which is never auto-applied). Tapping it runs the same sniper engine as
+    auto-apply and still respects `AUTO_APPLY_DRY_RUN`. It's owner-only — a shared "viewer" chat
+    (`TELEGRAM_VIEWER_CHAT_IDS`) only ever receives the plain listing alert, nothing else.
 
 ---
 
@@ -86,7 +93,8 @@ Ensure your Telegram credentials and settings are configured:
 ```env
 # Telegram Bot Settings
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
-TELEGRAM_CHAT_ID=your_telegram_chat_id_here
+TELEGRAM_CHAT_ID=your_telegram_chat_id_here          # owner -- gets everything
+TELEGRAM_VIEWER_CHAT_IDS=                            # optional, comma-separated -- gets ONLY listing alerts
 
 # Watcher Settings
 TARGET_CITY=Marseille
@@ -96,17 +104,32 @@ ENABLE_DAILY_HEARTBEAT=true
 
 # Smart Time Cadence
 ENABLE_SMART_CADENCE=true
-PEAK_CHECK_INTERVAL_SECONDS=35
+PEAK_CHECK_INTERVAL_SECONDS=15
 EVENING_CHECK_INTERVAL_SECONDS=65
 NIGHT_CHECK_INTERVAL_SECONDS=240
 
-# Auto-Apply (Sniper)
+# Auto-Apply (Sniper) -- individual mode only; colocation is NEVER auto-applied,
+# always alert-only (with the manual Snipe button as the override). Price/surface
+# tiers, most-lenient first:
+#   rent < AUTO_APPLY_CHEAP_MAX_PRICE               -> snipe, any surface
+#   AUTO_APPLY_CHEAP_MAX_PRICE..AUTO_APPLY_MID_MAX_PRICE -> snipe only if surface is
+#     between AUTO_APPLY_MID_MIN_SURFACE_M2 and AUTO_APPLY_MID_MAX_SURFACE_M2
+#   anything above AUTO_APPLY_MID_MAX_PRICE (up to MAX_PRICE) -> alert only
 AUTO_APPLY_ENABLED=true
-AUTO_APPLY_DRY_RUN=true            # Set to false when you are ready to live-submit!
+AUTO_APPLY_DRY_RUN=true            # Set to false only when you are ready to live-submit!
+AUTO_APPLY_CHEAP_MAX_PRICE=250
+AUTO_APPLY_MID_MAX_PRICE=300
+AUTO_APPLY_MID_MIN_SURFACE_M2=12
+AUTO_APPLY_MID_MAX_SURFACE_M2=19
 PREFERRED_OCCUPATION_MODE=single   # 'single' or 'sharing'
 STUDY_LEVEL=3                      # e.g. 1: L1, 2: L2, 3: L3, 4: M1, 5: M2
 PURPOSE=studies                    # 'studies' or 'internship'
 ```
+
+Proxies (`proxies.txt`, `proxies_residential.txt` — both gitignored, real credentials) are a
+separate concern from the above and split by purpose: a cheap datacenter pool for the scouter's
+plain polling, and a residential pool for login + the sniper's apply flow, since those need to
+look human. See `HANDOFF.md` for the full rationale and current provider/plan details.
 
 ### Step 3: Run the 1-Step Installer
 
