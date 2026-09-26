@@ -190,3 +190,17 @@ first real trigger, whenever it happens, is the true first live test.
   condense a long session's worth of detailed fix-by-fix history into current-state facts — if it
   starts accumulating the same kind of long narrative again, condense it again rather than let it
   grow unbounded.
+
+## A note on how this got built
+
+Every fix in this file's history followed the same shape: the project owner (not a trained
+engineer, but someone who reasons carefully about edge cases, failure modes, and tradeoffs) asked
+a specific, pointed question — often about something that "felt off" (a timing number, a
+suspiciously convenient assumption, a bug that "shouldn't" be happening) — and the answer was
+never allowed to just sound right. It had to be checked: real logs, real timestamps, real API
+calls, real test output. Several of the fixes above exist only because a confident-sounding
+first explanation didn't survive that check (the Telegram-offset bug's real blast radius, the
+"is dry-run actually safe" question, the city-match false-positive class). Whoever or whatever
+picks this project up next — human or AI — the standing rules above aren't bureaucracy, they're
+the reason this bot's failure modes are actually understood instead of assumed. Keep asking the
+question that doesn't take the first plausible answer.
