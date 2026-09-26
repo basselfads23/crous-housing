@@ -25,11 +25,29 @@ anything touching the auto-apply trigger logic (`is_target_listing`), the apply 
   Bringing it into the repo is still a nice-to-have, not urgent.
 - proxy_manager.py — TWO pools, THREE deliberately isolated selection systems:
   - **Datacenter pool** (proxies.txt, gitignored, real credentials): Webshare "Proxy Server" plan,
-    200 proxies + 5 Oxylabs, $5.98/mo, 250GB included. Used ONLY by the scouter
-    (get_current_proxy()/rotate_proxy(), group-aware exhaustion on HTTP 402, 24h TTL). 9 of the
-    original 200 confirmed dead (connection timeouts, not CROUS-side) and commented out
-    2026-09-25 — 196 confirmed healthy against the real search API. A live interval test found
-    zero errors down to 15s between polls and 1.0-1.5s between paginated requests (see below).
+    200 proxies + 5 Oxylabs, $5.98/mo, 250GB included. Used by the scouter
+    (get_current_proxy()/rotate_proxy(), group-aware exhaustion on HTTP 402, 24h TTL) and — found
+    2026-09-26, previously undocumented — by crous_auth.check_session_status() (see STILL OPEN #5).
+    9 of the original 200 confirmed dead (connection timeouts, not CROUS-side) and commented out
+    2026-09-25 — 196 confirmed healthy against the real search API. A 10th, 82.22.214.251:6103, was
+    commented out 2026-09-26: it answered 502 Bad Gateway to CONNECT tunnels to
+    trouverunlogement.lescrous.fr (3/3 tries, instantly) while reaching example.com fine and other
+    proxies reached CROUS fine → **195 active**. Backup: proxies.txt.bak-2026-09-26. A live
+    interval test found zero errors down to 15s between polls and 1.0-1.5s between paginated
+    requests (see below). The scouter takes ONE proxy per cycle (main_loop rotates each cycle), so
+    one full lap of the pool ≈ 196 cycles ≈ 78 min at peak cadence — that's why a bad proxy's
+    errors recur at a fixed ~79 min rhythm.
+    - **Per-proxy quarantine (added 2026-09-26, scouter/datacenter pool ONLY).** A proxy earns a
+      strike when it fails a request AND a different proxy then succeeds for that same request
+      (`proxy_manager.record_proxy_strike`, wired in `crous_watcher._settle_proxy_health`). All
+      attempts failing = nobody blamed (could be an outage). 402s are never strikes (they're
+      per-account, `mark_group_exhausted`). 3 consecutive strikes (any success resets) → benched
+      24h in `.proxy_quarantine.json` (gitignored via `*.json`; host:port only, no credentials);
+      after 24h one probation chance (1 more failure re-benches, 1 success clears). Hard cap: never
+      more than 25% of the pool benched (owner gets an alert instead), and a corrupt/missing state
+      file fails OPEN (nothing benched). `load_proxies()`, the sniper pool and the auth pool are
+      untouched. Manual reset: delete `.proxy_quarantine.json`. Tests: `verify_proxy_quarantine.py`
+      (20 tests; mutation-checked — 12 deliberate breakages, all caught).
   - **Residential pool** (proxies_residential.txt, gitignored): Webshare "Static Residential"
     plan, 20 proxies, $6.00/mo, 250GB included. Real home-ISP IPs (Comcast, Orange, Rogers,
     Telecom Italia, etc, confirmed via Webshare's asn_name field) — look human, unlike datacenter
@@ -55,6 +73,14 @@ anything touching the auto-apply trigger logic (`is_target_listing`), the apply 
   click) — not proven via network trace, but accepted as good enough.
 - activity_logger.py — Telegram error/failure alert dispatch (owner-only by construction — only
   ever reads TELEGRAM_CHAT_ID, never touches the viewer list) + scouter/sniper attempt logging.
+  scouter.log/sniper.log are capped at the last 2000 lines (~4-5h of scouter history at peak
+  cadence), and watcher.log's "Network issue on proxy" warnings don't name the proxy — so
+  proxy-level forensics has to be done the same day.
+  Since 2026-09-26 the scouter's error alert fires only when a request fails ALL its attempts
+  (error_message rides on the final attempt). A failure that a retry on the next proxy recovers is
+  still logged (scouter.log + watcher.log) and counted as a proxy strike, but no longer pages the
+  owner — this deliberately reversed an earlier "alert on every attempt" rule ("Fix A"; origin
+  not found in git). A proxy being benched sends one owner-only alert.
 - Telegram messaging is now split by audience (fixed 2026-09-25): the viewer
   (TELEGRAM_VIEWER_CHAT_IDS) gets ONLY the new-listing alert, nothing else. Errors, sniper
   results, test messages, and the startup/restart message are owner-only.
@@ -154,6 +180,13 @@ first real trigger, whenever it happens, is the true first live test.
    needed.
 4. The MCP `github` plugin connection failure (see Git state) — not needed for anything currently
    in use, but flag if GitHub-API-level tools become relevant.
+5. `crous_auth.check_session_status()` (the `/api/health` session check, used by session-keeper and
+   the watcher) calls `proxy_manager.load_proxies()` — the scouter's datacenter list — and always
+   uses its first 3 entries (`proxies_to_try[retry % len]`), never rotating. Found 2026-09-26,
+   NOT changed. It contradicts "datacenter pool is scouter-only" and bypasses the quarantine.
+   Decide: leave as is, or point it at the residential pool / a rotating source.
+6. `verify_proxy_group_fix.py` is still untracked in git (pre-existing; it passes) — commit or
+   delete it with the rest of the `verify_*.py` cleanup in #3.
 
 ## Standing rules for all future work in this repo
 - Redact all secrets (passwords, tokens, API keys) in any output or log you produce.
