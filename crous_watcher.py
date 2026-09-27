@@ -34,6 +34,7 @@ STATE_FILE = BASE_DIR / "listings_seen.json"
 HISTORY_LOG_FILE = BASE_DIR / "run_history.log"
 LOG_FILE = BASE_DIR / "watcher.log"
 LISTINGS_DATA_FILE = BASE_DIR / "marseille_listings_data.jsonl"
+NATIONWIDE_LISTINGS_DATA_FILE = BASE_DIR / "nationwide_listings_data.jsonl"
 NATIONWIDE_SEEN_FILE = BASE_DIR / "nationwide_seen_ids.json"
 POSTING_ACTIVITY_FILE = BASE_DIR / "posting_activity.json"
 TELEGRAM_OFFSET_FILE = BASE_DIR / ".telegram_update_offset"
@@ -834,6 +835,53 @@ def record_marseille_listing(info: dict, tool_id: str, listing_url: str) -> None
         logger.error(f"Failed to record listing data: {err}")
 
 
+def record_nationwide_listing_raw(item: dict, tool_id: str) -> None:
+    """
+    Append the FULL raw listing record, exactly as CROUS's search API returned it, for
+    ONE newly-seen listing -- any city, not just Marseille, and regardless of whether it
+    matches any auto-apply rule. Append-only JSONL (one JSON object per line), never
+    overwrites or trims previous entries.
+
+    Deliberately broader than record_marseille_listing() above, which keeps only a
+    curated subset of fields for Marseille matches: this keeps every field CROUS sent,
+    including ones the bot doesn't currently act on at all (equipments, media captions,
+    occupationModes, availability, indicators...). Added 2026-09-27 after a real
+    listing's private-kitchen/bathroom status turned out to hinge on exactly this kind
+    of field (the "equipments" list, e.g. "Evier + plaque" = a private kitchenette) --
+    and by the time that question came up, the listing had already disappeared from
+    CROUS's live search results (booked), with no way to recover what it had actually
+    offered. Also builds, over time, real data on whether new listings really do get
+    posted at night / on weekends (see HANDOFF "Night/day request throttling").
+    """
+    entry = {
+        "seen_at": datetime.now(timezone.utc).isoformat(),
+        "tool_id": tool_id,
+        "item": {k: v for k, v in item.items() if k != "_tool_id"},
+    }
+    try:
+        with open(NATIONWIDE_LISTINGS_DATA_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as err:
+        logger.error(f"Failed to record nationwide listing data: {err}")
+
+
+def _detect_and_record_nationwide_new(all_raw_items: list, nationwide_seen: set) -> set:
+    """
+    Given this cycle's full raw item list and the previously-seen nationwide ID set,
+    returns the set of genuinely new IDs (any city) and, as a side effect, records the
+    full raw item for each one via record_nationwide_listing_raw(). Extracted out of
+    check_and_notify() so this can be unit-tested directly, without mocking the
+    network/Telegram machinery around it.
+    """
+    new_ids = set()
+    for it in all_raw_items:
+        iid = str(it.get("id", ""))
+        if iid and iid not in nationwide_seen and iid not in new_ids:
+            new_ids.add(iid)
+            record_nationwide_listing_raw(it, it.get("_tool_id", "47"))
+    return new_ids
+
+
 def load_nationwide_seen_ids() -> set:
     """IDs of every listing ever seen nationwide (any city), for posting-activity tracking."""
     if not NATIONWIDE_SEEN_FILE.exists():
@@ -1514,9 +1562,7 @@ def check_and_notify() -> tuple[int, int]:
     # Nationwide (any city) new-listing detection, for posting-activity tracking --
     # separate from the Marseille-only seen_ids/alerting logic below.
     nationwide_seen = load_nationwide_seen_ids()
-    nationwide_new_ids = {
-        str(it.get("id", "")) for it in all_raw_items if str(it.get("id", "")) and str(it.get("id", "")) not in nationwide_seen
-    }
+    nationwide_new_ids = _detect_and_record_nationwide_new(all_raw_items, nationwide_seen)
     if nationwide_new_ids:
         save_nationwide_seen_ids(nationwide_seen | nationwide_new_ids)
 

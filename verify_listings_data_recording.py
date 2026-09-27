@@ -12,9 +12,16 @@ Verifies:
    lookup out of the city-match if/else (it used to only be defined in the
    "else" branch, which would have been a NameError once the parsed dict
    started referencing lat/lon unconditionally).
+4. record_nationwide_listing_raw() / _detect_and_record_nationwide_new()
+   (added 2026-09-27): the FULL raw item (not a curated subset) is recorded for
+   every genuinely new ID nationwide, any city; the internal "_tool_id" bookkeeping
+   key is stripped from the recorded item body; an item already in nationwide_seen
+   is not recorded again; a duplicate id appearing twice in the SAME batch is only
+   recorded once; the returned new-ids set matches exactly what the old inline
+   set-comprehension would have produced.
 
 Read-only-ish: writes to a temporary file, not the real
-marseille_listings_data.jsonl. No network access.
+marseille_listings_data.jsonl / nationwide_listings_data.jsonl. No network access.
 """
 import sys
 import json
@@ -110,6 +117,49 @@ with tempfile.TemporaryDirectory() as tmpdir:
         check("second recorded row has min_coloc_rent", row2.get("min_coloc_rent") == 300.0)
     finally:
         crous_watcher.LISTINGS_DATA_FILE = orig_file
+
+# --- 4. nationwide raw recording: full item kept, dedup, "_tool_id" stripped ---
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    tmp_file = Path(tmpdir) / "test_nationwide.jsonl"
+    orig_file = crous_watcher.NATIONWIDE_LISTINGS_DATA_FILE
+    crous_watcher.NATIONWIDE_LISTINGS_DATA_FILE = tmp_file
+    try:
+        rich_item = {
+            "id": "5001",
+            "label": "CHAMBRE SIMPLE",
+            "equipments": [{"category": "Bâtiment", "label": "WC"}],
+            "medias": [{"src": "x.jpg", "description": "coin cuisine"}],
+            "_tool_id": "47",  # internal bookkeeping key injected by check_and_notify()
+        }
+        already_seen_item = {"id": "5002", "_tool_id": "47"}
+        duplicate_in_batch = [
+            {"id": "5003", "_tool_id": "22"},
+            {"id": "5003", "_tool_id": "22"},  # same id twice in one fetch (paranoia case)
+        ]
+        no_id_item = {"label": "no id field, must be skipped"}
+
+        batch = [rich_item, already_seen_item] + duplicate_in_batch + [no_id_item]
+        new_ids = crous_watcher._detect_and_record_nationwide_new(batch, nationwide_seen={"5002"})
+
+        check("new-ids set matches expectation (5002 already seen, no-id skipped, 5003 counted once)",
+              new_ids == {"5001", "5003"}, str(new_ids))
+
+        lines = [json.loads(l) for l in tmp_file.read_text(encoding="utf-8").strip().split("\n")]
+        check("exactly 2 lines recorded (not 3 -- the in-batch duplicate wasn't double-written)", len(lines) == 2, str(len(lines)))
+
+        rich_row = next(r for r in lines if r["item"]["id"] == "5001")
+        check("full raw item preserved, including fields record_marseille_listing() would have dropped",
+              rich_row["item"].get("equipments") == rich_item["equipments"]
+              and rich_row["item"].get("medias") == rich_item["medias"])
+        check("'_tool_id' bookkeeping key stripped from the recorded item body", "_tool_id" not in rich_row["item"])
+        check("tool_id recorded in the envelope instead", rich_row.get("tool_id") == "47")
+        check("seen_at timestamp present", isinstance(rich_row.get("seen_at"), str) and len(rich_row["seen_at"]) > 0)
+
+        dup_rows = [r for r in lines if r["item"]["id"] == "5003"]
+        check("the in-batch duplicate id was recorded exactly once", len(dup_rows) == 1, str(len(dup_rows)))
+    finally:
+        crous_watcher.NATIONWIDE_LISTINGS_DATA_FILE = orig_file
 
 failed = sum(1 for _, ok in results if not ok)
 print()
