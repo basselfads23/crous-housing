@@ -121,12 +121,18 @@ NIGHT_CHECK_INTERVAL_SECONDS = int(os.getenv("NIGHT_CHECK_INTERVAL_SECONDS", "24
 # (300-350e, >19m2) existed briefly but was removed the same day -- too loose to
 # trust unattended; that price band is alert-only now, with the manual Snipe
 # button as the override for anything in it worth grabbing.
+# The 250-300e tier's upper surface bound (was 19m2) was removed 2026-09-28 -- at
+# the user's explicit request ("we don't want to restrict the bot...
+# what if it was a 20m2 room for 270? We don't want the bot to miss this one."):
+# in this price band, bigger is strictly a better find, never a riskier one, so
+# only the floor matters (it guards against "cheap because it's tiny"). This is
+# NOT a reinstatement of the removed third tier above -- that was about a
+# different, more expensive price band (300-350e) and stays removed.
 AUTO_APPLY_ENABLED = os.getenv("AUTO_APPLY_ENABLED", "true").lower() in ("true", "1", "yes")
 AUTO_APPLY_DRY_RUN = os.getenv("AUTO_APPLY_DRY_RUN", "true").lower() in ("true", "1", "yes")
 AUTO_APPLY_CHEAP_MAX_PRICE = float(os.getenv("AUTO_APPLY_CHEAP_MAX_PRICE", "250"))
 AUTO_APPLY_MID_MAX_PRICE = float(os.getenv("AUTO_APPLY_MID_MAX_PRICE", "300"))
 AUTO_APPLY_MID_MIN_SURFACE_M2 = float(os.getenv("AUTO_APPLY_MID_MIN_SURFACE_M2", "12"))
-AUTO_APPLY_MID_MAX_SURFACE_M2 = float(os.getenv("AUTO_APPLY_MID_MAX_SURFACE_M2", "19"))
 
 
 def _format_sniper_rules_text() -> str:
@@ -139,7 +145,7 @@ def _format_sniper_rules_text() -> str:
     return (
         f"⚡ *Sniper < {AUTO_APPLY_CHEAP_MAX_PRICE:.0f} € :* Individuel, toute surface ({mode_tag})\n"
         f"🎯 *Sniper {AUTO_APPLY_CHEAP_MAX_PRICE:.0f}–{AUTO_APPLY_MID_MAX_PRICE:.0f} € :* Individuel, "
-        f"{AUTO_APPLY_MID_MIN_SURFACE_M2:.0f}–{AUTO_APPLY_MID_MAX_SURFACE_M2:.0f} m² ({mode_tag})\n"
+        f"≥ {AUTO_APPLY_MID_MIN_SURFACE_M2:.0f} m² ({mode_tag})\n"
         f"📢 *Alerte seule (+ bouton Snipe manuel) :* Colocation (toujours), "
         f"Individuel {AUTO_APPLY_MID_MAX_PRICE:.0f}–{MAX_PRICE:.0f} €"
     )
@@ -1332,8 +1338,10 @@ def is_target_listing(item: dict) -> tuple[bool, dict]:
     auto-applied, always alert-only:
     - rent < AUTO_APPLY_CHEAP_MAX_PRICE (250€) -> Snipe immediately, any surface.
     - AUTO_APPLY_CHEAP_MAX_PRICE <= rent <= AUTO_APPLY_MID_MAX_PRICE (250-300€) ->
-      Snipe only if surface is between AUTO_APPLY_MID_MIN_SURFACE_M2 and
-      AUTO_APPLY_MID_MAX_SURFACE_M2 (12-19 m²), inclusive.
+      Snipe if surface is at least AUTO_APPLY_MID_MIN_SURFACE_M2 (12 m²) -- no
+      upper bound (removed 2026-09-28: in this price band a bigger room is
+      strictly a better find, never a riskier one; the floor alone still guards
+      against "cheap because it's tiny").
     - Anything else within MAX_PRICE (400€) -> Alert only via Telegram, do NOT
       auto-apply (a manual Snipe button is offered instead). A third tier
       (300-350€, >19m²) existed briefly but was removed 2026-09-25 as too loose
@@ -1426,9 +1434,11 @@ def is_target_listing(item: dict) -> tuple[bool, dict]:
         if x < AUTO_APPLY_CHEAP_MAX_PRICE:
             should_auto_apply = True
         elif AUTO_APPLY_CHEAP_MAX_PRICE <= x <= AUTO_APPLY_MID_MAX_PRICE:
+            # No upper surface bound here (removed 2026-09-28) -- only the floor
+            # matters; a bigger room in this price band is never a worse find.
             should_auto_apply = (
                 surface_val is not None
-                and AUTO_APPLY_MID_MIN_SURFACE_M2 <= surface_val <= AUTO_APPLY_MID_MAX_SURFACE_M2
+                and surface_val >= AUTO_APPLY_MID_MIN_SURFACE_M2
             )
         # Third tier (AUTO_APPLY_MID_MAX_PRICE < x <= 350e, surface > 19m2) removed
         # 2026-09-25 -- too loose to trust unattended. That band is alert-only now;

@@ -15,6 +15,12 @@ anything touching the auto-apply trigger logic (`is_target_listing`), the apply 
 ## Architecture
 - crous_watcher.py — main polling loop, Telegram bot (commands + the owner-only "Snipe" button),
   fetch_all_crous_listings(), discover_tool_ids() (cached hourly), check_and_notify(), main_loop().
+  Since 2026-09-27, record_nationwide_listing_raw() also appends the FULL raw CROUS record (every
+  field, not a curated subset — equipments, media captions, occupationModes, availability...) to
+  nationwide_listings_data.jsonl for every genuinely new listing anywhere in France, via
+  _detect_and_record_nationwide_new(). Separate from, and in addition to, record_marseille_listing()
+  (Marseille-only, curated subset, unchanged). Not gitignored, not currently git-tracked either —
+  a decision on whether to commit this (and marseille_listings_data.jsonl) is still open.
 - crous_auth.py — Playwright headless login/session renewal (auto_login()), Altcha PoW solver,
   session.json read/write, check_session_status()/is_session_valid(). Audited — correct as-is.
 - session_keeper.py — lives at /home/ubuntu/session_keeper.py, OUTSIDE this git repo (untracked).
@@ -27,7 +33,7 @@ anything touching the auto-apply trigger logic (`is_target_listing`), the apply 
   - **Datacenter pool** (proxies.txt, gitignored, real credentials): Webshare "Proxy Server" plan,
     200 proxies + 5 Oxylabs, $5.98/mo, 250GB included. Used by the scouter
     (get_current_proxy()/rotate_proxy(), group-aware exhaustion on HTTP 402, 24h TTL) and — found
-    2026-09-26, previously undocumented — by crous_auth.check_session_status() (see STILL OPEN #5).
+    2026-09-26, previously undocumented — by crous_auth.check_session_status() (see STILL OPEN #7).
     9 of the original 200 confirmed dead (connection timeouts, not CROUS-side) and commented out
     2026-09-25 — 196 confirmed healthy against the real search API. A 10th, 82.22.214.251:6103, was
     commented out 2026-09-26: it answered 502 Bad Gateway to CONNECT tunnels to
@@ -109,7 +115,7 @@ anything touching the auto-apply trigger logic (`is_target_listing`), the apply 
 ## Current sniper trigger rules (individual only; colocation is NEVER auto-applied)
 ```
 rent < 250€            -> auto-snipe, any surface
-250€ <= rent <= 300€    -> auto-snipe only if surface is 12-19 m² (inclusive)
+250€ <= rent <= 300€    -> auto-snipe if surface >= 12 m² (no upper bound)
 rent > 300€, <= 400€    -> alert only (manual Snipe button available)
 colocation, any price   -> alert only, always (manual Snipe button available)
 ```
@@ -117,6 +123,31 @@ A third auto-tier (300-350€, >19m²) existed briefly on 2026-09-25 and was del
 "too loose to trust unattended." That band is manual-button-only now. Fails safe (no auto-apply,
 no guessing) if surface data is ever missing. Anchor cases: a real 255€/12m² and a real
 284.82€/19m² T1 both auto-snipe; a real 350€/14m² room does not.
+
+The 250-300€ tier's upper surface bound (was 19m², inclusive) was removed 2026-09-28 at the
+user's explicit request — "we don't want to restrict the bot... what if it was a 20m2 room for
+270? We don't want the bot to miss this one." In this price band a bigger room is strictly a
+better find, never a riskier one, so only the floor (12m²) still guards against "cheap because
+it's tiny." `AUTO_APPLY_MID_MAX_SURFACE_M2` was removed from `.env` and the codebase entirely
+(not left dead/unused) — do not reintroduce it without being asked. This is NOT a reinstatement
+of the removed third tier above (different, higher price band, deliberately stays alert-only).
+Verified: `verify_sniper_tier_logic.py` (24 tests, includes the hypothetical 20m²/270€ case),
+mutation-checked (4/4 deliberate breakages caught: cap reintroduced, floor dropped, missing-
+surface no longer fails safe, colocation exclusion bypassed).
+
+**Reminder (not yet built, flagged 2026-09-27):** a successful snipe is not the end of the
+process — CROUS gives a 2-3 day window to submit supporting documents before the demande is
+auto-removed. Nothing in this codebase tracks that deadline or reminds the owner. Still open.
+
+**The kitchen/bathroom "gotcha" (found 2026-09-27, still NOT wired into any trigger logic):**
+none of the rules above check whether a room's kitchen/toilet are private vs shared down the
+hall — they only check rent, surface, and individual-vs-colocation. CROUS's own `equipments`
+field on each raw item (now captured in full via `nationwide_listings_data.jsonl`, see Architecture)
+is a real signal — presence of `WC` and `Evier + plaque` correlates with private facilities,
+confirmed directly against two real listings' own descriptions (one explicitly private, one
+explicitly "Les WC et les cuisines sont collectifs") — but only 2 confirmed real examples exist
+so far and this has NOT been added to `is_target_listing()`. A cheap individual room with shared
+facilities (like the 2026-09-27 Gaston Berger snipe) can and will still auto-snipe today.
 
 ## Current cadence (tightened 2026-09-25, all changes backed by live testing, not guesses)
 - Peak hours (08:00-18:30 Paris): 15s between polls (was 50s) — live-tested down to 15s with
@@ -166,27 +197,40 @@ everything tested has been manual CLI/button triggers against non-Marseille test
 first real trigger, whenever it happens, is the true first live test.
 
 ## STILL OPEN, IN PRIORITY ORDER
-1. Watch for the first real Marseille listing and how the live (non-dry-run) sniper actually
-   performs on it — nothing so far has exercised the true automatic end-to-end path.
-2. Night/day request throttling (permanent version) — proposed, never built. Now has a real data
+1. **DONE 2026-09-27** ~~Watch for the first real Marseille listing...~~ — happened: Gaston
+   Berger, 255€/12m², id 2156, real LIVE (non-dry-run) auto-snipe, ~51s detection-to-confirmed-
+   submission (within the estimated 27-57s window). Full trace in git history around that date.
+   Sniping was then briefly paused, restarted in DRY-RUN for a day to keep collecting data
+   without risk, then turned back LIVE 2026-09-28 at the user's explicit call.
+2. **New, real-world, not yet built:** a successful snipe is NOT the end of the process — CROUS
+   gives a 2-3 day window after booking to submit supporting documents, or the demande is
+   auto-removed. Nothing in this codebase tracks that deadline or reminds the owner. Proposed (not
+   built): a Telegram reminder tied to each successful snipe, pure alerting/logging, doesn't touch
+   apply/auth code — low risk.
+3. **New, real-world, not yet built:** the kitchen/bathroom "gotcha" — none of the auto-apply rules
+   check whether a room's kitchen/toilet are private vs shared down the hall, only rent/surface/
+   individual-vs-colocation. See the sniper-rules section above for what's known and what isn't
+   (only 2 confirmed real examples so far; NOT wired into is_target_listing()).
+4. Night/day request throttling (permanent version) — proposed, never built. Now has a real data
    source (`posting_activity.json`, recording first/last-seen listing times daily, nationwide and
    Marseille separately) instead of the untested "quiet at night/on Sundays" assumption — revisit
    once enough days have accumulated. Throttle only, never a hard stop, per original reasoning —
    though bandwidth is no longer the constraint it once was, so re-examine the cost/benefit once
    there's real posting-hours data.
-3. Cleanup (low priority, no correctness risk): `seen_ids` in listings_seen.json and
+5. Cleanup (low priority, no correctness risk): `seen_ids` in listings_seen.json and
    `nationwide_seen_ids.json` both grow forever, never trimmed. Also move the various
    `verify_*.py` test files and `proxies.txt.bak-2026-09-25` into `tests/` or delete once no longer
-   needed.
-4. The MCP `github` plugin connection failure (see Git state) — not needed for anything currently
+   needed. Also decide whether `marseille_listings_data.jsonl` / `nationwide_listings_data.jsonl`
+   should be git-tracked (neither is currently, and neither is gitignored either).
+6. The MCP `github` plugin connection failure (see Git state) — not needed for anything currently
    in use, but flag if GitHub-API-level tools become relevant.
-5. `crous_auth.check_session_status()` (the `/api/health` session check, used by session-keeper and
+7. `crous_auth.check_session_status()` (the `/api/health` session check, used by session-keeper and
    the watcher) calls `proxy_manager.load_proxies()` — the scouter's datacenter list — and always
    uses its first 3 entries (`proxies_to_try[retry % len]`), never rotating. Found 2026-09-26,
    NOT changed. It contradicts "datacenter pool is scouter-only" and bypasses the quarantine.
    Decide: leave as is, or point it at the residential pool / a rotating source.
-6. `verify_proxy_group_fix.py` is still untracked in git (pre-existing; it passes) — commit or
-   delete it with the rest of the `verify_*.py` cleanup in #3.
+8. `verify_proxy_group_fix.py` is still untracked in git (pre-existing; it passes) — commit or
+   delete it with the rest of the `verify_*.py` cleanup in #5.
 
 ## Standing rules for all future work in this repo
 - Redact all secrets (passwords, tokens, API keys) in any output or log you produce.

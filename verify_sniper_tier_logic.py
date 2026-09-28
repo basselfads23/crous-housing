@@ -3,19 +3,25 @@ verify_sniper_tier_logic.py — run with: venv/bin/python3 verify_sniper_tier_lo
 
 Verifies the price/surface-tiered auto-apply trigger in is_target_listing():
   - rent < 250e            -> snipe (individual), any surface
-  - 250e <= rent <= 300e   -> snipe only if 12-19 m2 (inclusive)
+  - 250e <= rent <= 300e   -> snipe if surface >= 12 m2, NO upper bound (the
+    19m2 cap was removed 2026-09-28 at the user's request: "we don't want to
+    restrict the bot... what if it was a 20m2 room for 270? We don't want the
+    bot to miss this one." -- only the floor still guards against "cheap
+    because it's tiny")
   - rent > 300e            -> alert only, NEVER auto-applied (the third tier,
     300-350e/>19m2, existed briefly but was removed 2026-09-25 as too loose to
-    trust unattended -- the manual Snipe button covers this band instead)
+    trust unattended -- the manual Snipe button covers this band instead; this
+    is unaffected by, and not a reinstatement of, the 2026-09-28 change above)
   - colocation             -> NEVER auto-applied, alert only, regardless of price
   - AUTO_APPLY_ENABLED=False -> never auto-applied regardless of price/surface
   - missing surface data at a price that needs a surface check -> fails safe
     (does NOT auto-apply; never guesses)
 
-Includes the three real listings from this week's Telegram alerts as anchor
-cases: Alice Chatenoud (284.82e/19m2) and Gaston Berger (255e/12m2) should both
-trigger; Luminy (350e/14m2) should not (never did, and now the whole 300-350e
-band doesn't auto-apply at all regardless of surface).
+Includes real listings from Telegram alerts as anchor cases: Alice Chatenoud
+(284.82e/19m2) and Gaston Berger (255e/12m2) should both trigger; Luminy
+(350e/14m2) should not (never did, and now the whole 300-350e band doesn't
+auto-apply at all regardless of surface). The 20m2/270e case is hypothetical
+(motivated the 2026-09-28 change but hasn't occurred as a real listing yet).
 
 Read-only / no network.
 """
@@ -95,9 +101,14 @@ class TestSniperTierLogic(unittest.TestCase):
         _, info = crous_watcher.is_target_listing(make_item(280.0, 11.9))
         self.assertFalse(info["should_auto_apply"])
 
-    def test_mid_band_rejects_surface_above_19(self):
+    def test_mid_band_no_longer_rejects_surface_above_19(self):
+        # Was assertFalse before 2026-09-28 (the old 19m2 cap); the cap is gone now.
         _, info = crous_watcher.is_target_listing(make_item(280.0, 19.1))
-        self.assertFalse(info["should_auto_apply"])
+        self.assertTrue(info["should_auto_apply"])
+
+    def test_mid_band_snipes_a_much_larger_surface_no_cap_at_all(self):
+        _, info = crous_watcher.is_target_listing(make_item(280.0, 100.0))
+        self.assertTrue(info["should_auto_apply"])
 
     def test_mid_band_missing_surface_fails_safe_no_snipe(self):
         _, info = crous_watcher.is_target_listing(make_item(280.0, None))
@@ -157,6 +168,13 @@ class TestSniperTierLogic(unittest.TestCase):
     def test_real_luminy_350_at_14m2_does_not_snipe(self):
         _, info = crous_watcher.is_target_listing(make_item(350.0, 14.0, label="CHAMBRE CONFORT D"))
         self.assertFalse(info["should_auto_apply"])
+
+    def test_hypothetical_20m2_at_270_snipes(self):
+        # The exact motivating example for the 2026-09-28 change: previously this
+        # would NOT have auto-sniped (surface > the old 19m2 cap) even though 270e
+        # for 20m2 is a strictly better deal than the same price at 12m2.
+        _, info = crous_watcher.is_target_listing(make_item(270.0, 20.0))
+        self.assertTrue(info["should_auto_apply"])
 
 
 if __name__ == "__main__":
