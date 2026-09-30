@@ -54,6 +54,10 @@ anything touching the auto-apply trigger logic (`is_target_listing`), the apply 
       file fails OPEN (nothing benched). `load_proxies()`, the sniper pool and the auth pool are
       untouched. Manual reset: delete `.proxy_quarantine.json`. Tests: `verify_proxy_quarantine.py`
       (20 tests; mutation-checked — 12 deliberate breakages, all caught).
+      **CONFIRMED working in real production (2026-09-29/30):** fired for the first time on real
+      traffic, unprompted — 3 proxies benched on genuine `407 Proxy Authentication Required`
+      errors, exactly one Telegram alert each, no repeat noise, all 3 correctly excluded from
+      rotation afterward. Not just passing synthetic tests anymore.
   - **Residential pool** (proxies_residential.txt, gitignored): Webshare "Static Residential"
     plan, 20 proxies, $6.00/mo, 250GB included. Real home-ISP IPs (Comcast, Orange, Rogers,
     Telecom Italia, etc, confirmed via Webshare's asn_name field) — look human, unlike datacenter
@@ -141,13 +145,29 @@ auto-removed. Nothing in this codebase tracks that deadline or reminds the owner
 
 **The kitchen/bathroom "gotcha" (found 2026-09-27, still NOT wired into any trigger logic):**
 none of the rules above check whether a room's kitchen/toilet are private vs shared down the
-hall — they only check rent, surface, and individual-vs-colocation. CROUS's own `equipments`
-field on each raw item (now captured in full via `nationwide_listings_data.jsonl`, see Architecture)
-is a real signal — presence of `WC` and `Evier + plaque` correlates with private facilities,
-confirmed directly against two real listings' own descriptions (one explicitly private, one
-explicitly "Les WC et les cuisines sont collectifs") — but only 2 confirmed real examples exist
-so far and this has NOT been added to `is_target_listing()`. A cheap individual room with shared
-facilities (like the 2026-09-27 Gaston Berger snipe) can and will still auto-snipe today.
+hall — they only check rent, surface, and individual-vs-colocation. A cheap individual room with
+shared facilities (like the 2026-09-27 Gaston Berger snipe) can and will still auto-snipe today.
+
+**CONFIRMED (2026-09-30, 104 real individual listings sampled nationwide via
+`nationwide_listings_data.jsonl`):** CROUS's own `equipments` field on each raw item is a
+reliable signal, not a guess — absence of the `Evier + plaque` tag (private kitchenette) on a
+plain "CHAMBRE"-labeled listing correctly predicted shared facilities in 91% of cases (20/22
+real examples), matching the Gaston Berger ground truth exactly (its own listing page: "Les WC
+et les cuisines sont collectifs"). The free-text `label` field alone is NOT reliable ("CHAMBRE
+SIMPLE" vs "CHAMBRE 9M²" vs "Chambre simple de T1" mean different things) — the fix, if built,
+must key off `equipments`, not `label`. Still not wired into `is_target_listing()` — this was
+investigation only, not yet implemented, and no one has asked for it to be.
+
+**Colocation ≠ sharing a bedroom, in most cases (CONFIRMED 2026-09-30, 24 real colocation
+listings sampled).** The owner's original assumption was right for the large majority: 22/24
+(92%) of colocation (`house_sharing`) listings are real flatshares — a shared apartment where
+each person gets their own private room (`bedCount` < `roomCount`, e.g. 4 people / 5 rooms, the
+5th being a shared living room). **But the risky kind — two people in the literal same room —
+is real and does occur**: 2/24 (8%) had `bedCount >= roomCount` in a single-room unit, both
+labeled "T1 Bis" ("T1 bis 24 à 31m2", "T1Bis"). n=2 is too small to trust "T1 Bis" itself as the
+predictor, but the underlying check (`bedCount` vs `roomCount` on the raw item) is now backed by
+3 real examples total (1 found 2026-09-27 + 2 more here) and reliably tells the two apart. Not
+wired into anything — colocation stays alert-only, always, regardless.
 
 ## Current cadence (tightened 2026-09-25, all changes backed by live testing, not guesses)
 - Peak hours (08:00-18:30 Paris): 15s between polls (was 50s) — live-tested down to 15s with
@@ -209,14 +229,27 @@ first real trigger, whenever it happens, is the true first live test.
    apply/auth code — low risk.
 3. **New, real-world, not yet built:** the kitchen/bathroom "gotcha" — none of the auto-apply rules
    check whether a room's kitchen/toilet are private vs shared down the hall, only rent/surface/
-   individual-vs-colocation. See the sniper-rules section above for what's known and what isn't
-   (only 2 confirmed real examples so far; NOT wired into is_target_listing()).
-4. Night/day request throttling (permanent version) — proposed, never built. Now has a real data
-   source (`posting_activity.json`, recording first/last-seen listing times daily, nationwide and
-   Marseille separately) instead of the untested "quiet at night/on Sundays" assumption — revisit
-   once enough days have accumulated. Throttle only, never a hard stop, per original reasoning —
-   though bandwidth is no longer the constraint it once was, so re-examine the cost/benefit once
-   there's real posting-hours data.
+   individual-vs-colocation. See the sniper-rules section above — the `equipments`-based signal
+   is now CONFIRMED reliable (91% on 22 real examples) and the colocation shared-room check is
+   CONFIRMED too (3 real examples), but NEITHER is wired into `is_target_listing()` yet.
+4. Night/day request throttling (permanent version) — proposed, never built. Still open, but the
+   underlying assumption is no longer untested:
+   - **CONFIRMED (2026-09-30):** CROUS does NOT go quiet on Sundays — 22 new listings posted
+     nationwide on Sunday 2026-09-27 alone, including the one that got sniped. The old "quiet at
+     night/on Sundays" assumption behind smart cadence was wrong on the Sunday half.
+   - **CONFIRMED for the current cadence windows specifically (2026-09-30, 120 real listings,
+     Mon-Wed only so far):** matched against the exact configured windows in `get_smart_cadence()`
+     — peak 08:00-18:30 (15s) captured 91.7% of real activity, evening 18:30-23:30 (75s) captured
+     0.8% (1 listing), night 23:30-08:00 (240s) captured 7.5% (9 listings, mostly clustered
+     04:00-07:00). This validates the peak window strongly.
+   - **NOT yet settled, needs more exposure before touching any config:** the evening window looks
+     probably safe to slow down further (almost nothing lands there), and the night window is
+     probably worth tightening from 240s (real listings do land there, each sitting undetected up
+     to 4 minutes instead of 15s) — but this is 3 weekdays only, no weekend hourly breakdown yet,
+     and no auto-snipe-eligible listing has yet been confirmed to land specifically in the night
+     window, so there's no evidence yet that the current 240s has actually cost a real snipe.
+     Revisit once weekend hourly data exists and more days have accumulated. Throttle only, never
+     a hard stop, per original reasoning.
 5. Cleanup (low priority, no correctness risk): `seen_ids` in listings_seen.json and
    `nationwide_seen_ids.json` both grow forever, never trimmed. Also move the various
    `verify_*.py` test files and `proxies.txt.bak-2026-09-25` into `tests/` or delete once no longer
@@ -231,6 +264,14 @@ first real trigger, whenever it happens, is the true first live test.
    Decide: leave as is, or point it at the residential pool / a rotating source.
 8. `verify_proxy_group_fix.py` is still untracked in git (pre-existing; it passes) — commit or
    delete it with the rest of the `verify_*.py` cleanup in #5.
+9. `is_target_listing()`'s price fallback (`raw_price = item.get("price") or 0`, used only when
+   an item has NO usable `occupationModes` rent) defaults a listing with genuinely missing price
+   data to €0 — i.e. auto-snipes it immediately, the opposite of the surface check's fail-safe
+   two rows below it, which correctly refuses to guess. Found 2026-09-28, NOT fixed.
+   **CONFIRMED still purely theoretical as of 2026-09-30:** checked across all 120 real listings
+   collected in `nationwide_listings_data.jsonl` so far — zero have ever hit this fallback path.
+   Worth fixing on principle (same pattern as the surface fix), not because it's caused a
+   real incident.
 
 ## Standing rules for all future work in this repo
 - Redact all secrets (passwords, tokens, API keys) in any output or log you produce.
