@@ -151,6 +151,88 @@ def _format_sniper_rules_text() -> str:
     )
 
 
+def _session_keeper_state() -> str:
+    """'active', 'inactive', or 'unknown' -- session-keeper.service is a separate systemd unit."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["systemctl", "is-active", "session-keeper.service"],
+            capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        return "active" if out == "active" else "inactive"
+    except Exception:
+        return "unknown"
+
+
+def _count_lines(path: Path) -> int:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return sum(1 for _ in f)
+    except Exception:
+        return 0
+
+
+def _format_bot_capabilities_text(paused: bool, keeper_state: str, has_credentials: bool) -> str:
+    """
+    Plain-language summary of what the bot does and does NOT do right now, built from
+    the live config, for /status. Pure function (all external state passed in or read
+    from module config) so it can be tested without systemd or Telegram.
+    """
+    viewers = len(get_viewer_chat_ids())
+    nationwide_n = _count_lines(NATIONWIDE_LISTINGS_DATA_FILE)
+    marseille_n = _count_lines(LISTINGS_DATA_FILE)
+
+    does = []
+    does_not = []
+
+    if paused:
+        does_not.append("🚫 Recherche d'offres : *EN PAUSE* (`/resume` pour reprendre)")
+    else:
+        does.append("✅ Recherche des offres CROUS (toute la France) via l'API publique — *sans connexion à ton compte*")
+        does.append(
+            f"✅ Alerte Telegram pour chaque nouvelle offre à {TARGET_CITY.capitalize()} ≤ {MAX_PRICE:.0f} € "
+            f"(toi + {viewers} viewer{'s' if viewers != 1 else ''})"
+        )
+        does.append(
+            f"✅ Collecte de données : {nationwide_n} offres France + {marseille_n} offres "
+            f"{TARGET_CITY.capitalize()} enregistrées, + heures de publication suivies"
+        )
+
+    if AUTO_APPLY_ENABLED:
+        mode = "🧪 DRY-RUN (capture seulement, aucune vraie demande)" if AUTO_APPLY_DRY_RUN \
+            else "⚡ LIVE (envoie de VRAIES demandes de réservation)"
+        does.append(f"✅ Auto-candidature : *ACTIVÉE* — {mode}\n{_format_sniper_rules_text()}")
+    else:
+        does_not.append("🚫 Auto-candidature : *désactivée* — aucune candidature automatique")
+
+    if keeper_state == "active" and AUTO_APPLY_ENABLED:
+        does.append("✅ Session keeper : se reconnecte à ton compte CROUS toutes les ~20 min")
+    elif keeper_state == "active":
+        does_not.append("🚫 Session keeper : lancé mais en veille (auto-candidature off) — aucune connexion")
+    elif keeper_state == "inactive":
+        does_not.append("🚫 Session keeper : arrêté — aucune connexion automatique à ton compte")
+    else:
+        does_not.append("❓ Session keeper : état inconnu")
+
+    text = "📋 *Ce que le bot FAIT :*\n" + ("\n".join(does) if does else "— rien —")
+    text += "\n\n🚫 *Ce que le bot NE FAIT PAS :*\n" + ("\n".join(does_not) if does_not else "— rien —")
+
+    if has_credentials:
+        snipe_effect = "capture seulement (DRY-RUN)" if AUTO_APPLY_DRY_RUN \
+            else "envoie une *VRAIE demande de réservation*"
+        snipe_where = "sur *chaque* alerte" if not AUTO_APPLY_ENABLED \
+            else "sur les alertes non auto-snipées"
+        text += (
+            "\n\n⚠️ *Seulement si TU le déclenches (se connecte à ton compte) :*\n"
+            f"• Bouton 🎯 Snipe ({snipe_where}) → {snipe_effect}\n"
+            "• `/renew` → connexion au compte\n"
+            "• `/test_apply` → connexion + test (capture seulement)"
+        )
+    else:
+        text += "\n\n🔒 *Aucun identifiant CROUS configuré* — le bot ne peut pas se connecter à ton compte."
+    return text
+
+
 # Proxy manager integration
 try:
     import proxy_manager
@@ -621,9 +703,12 @@ def handle_telegram_command(cmd: str, on_check_callback=None):
             f"💾 *Offres déjà enregistrées :* {len(state.get('seen_ids', []))}\n"
             f"⚠️ *Échecs consécutifs :* {state.get('consecutive_failures', 0)}\n\n"
             f"🔐 *Session CROUS :* {'Connecté ✅' if is_logged_in else 'Non connecté / Expiré ❌'}\n"
-            f"🤖 *Auto-Apply :* {'Activé' if AUTO_APPLY_ENABLED else 'Désactivé'}\n"
-            f"{_format_sniper_rules_text()}\n"
-            f"🎯 *Cible :* {TARGET_CITY.capitalize()}"
+            f"🎯 *Cible :* {TARGET_CITY.capitalize()}\n\n"
+            + _format_bot_capabilities_text(
+                paused=PAUSED,
+                keeper_state=_session_keeper_state(),
+                has_credentials=bool(os.getenv("CROUS_EMAIL") and os.getenv("CROUS_PASSWORD")),
+            )
         )
         send_telegram_message(status_text)
 
