@@ -13,6 +13,11 @@ Verifies the "what the bot does / does NOT do" section of /status
 - every variant is valid Telegram legacy Markdown (balanced * and `, no bare _)
 - /status actually includes the section (mocked send, no network, no systemd)
 """
+import logging
+# crous_watcher calls logging.basicConfig() at import, which attaches a FileHandler on the
+# live watcher.log. basicConfig is a no-op when the root logger already has a handler, so
+# attach one first to keep test noise out of the production log.
+logging.getLogger().addHandler(logging.NullHandler())
 import itertools
 import re
 import unittest

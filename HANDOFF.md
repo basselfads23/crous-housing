@@ -36,6 +36,29 @@ the 🎯 Snipe button (shown on EVERY alert while auto-apply is off, and LIVE), 
   _detect_and_record_nationwide_new(). Separate from, and in addition to, record_marseille_listing()
   (Marseille-only, curated subset, unchanged). Not gitignored, not currently git-tracked either —
   a decision on whether to commit this (and marseille_listings_data.jsonl) is still open.
+- **Alerts fire once per APPEARANCE (since 2026-10-02), not once per listing ID ever.**
+  Before, `seen_ids` never forgot an ID, so a listing that went offline and was re-posted was
+  silently ignored forever — no alert, no Marseille data line. Measured: since 2026-09-27 Marseille
+  listings were visible ~38 separate times but only 4 alerted; #1165 (Luminy, 350€) re-posted
+  2026-10-02 10:44 got nothing, and the viewer saw ~6 listings online while the owner got 2 alerts.
+  Now `update_listing_visibility()` keeps `active` (online now) + `history` (appearance counts)
+  in listings_seen.json: alert when a listing comes online, never again while it stays online,
+  and again (as "🔁 OFFRE DE NOUVEAU DISPONIBLE", with its appearance number) after it goes
+  offline and comes back. "Offline" = missing from `LISTING_GONE_AFTER_MISSES` (2) COMPLETE
+  checks in a row; a check where any tool fetch failed never counts as missing. Why 2, not 1:
+  the API has returned incomplete results with no error (France 53 -> 8 for one check,
+  2026-09-30 00:00 UTC; Marseille 3 -> 2 -> 3 twice on 2026-10-02) — with 1, each such glitch
+  would re-alert everything it hid. marseille_listings_data.jsonl now gets an `"event": "appeared"`
+  line per appearance (`appearance_no`, `reappearance`) and an `"event": "gone"` line when one goes
+  offline (`online_seconds`, `checks_seen`) — lines from before 2026-10-02 have no `event` field.
+  posting_activity.json's Marseille count now counts appearances. The auto-sniper (if re-enabled)
+  also fires on re-appearances — intended, since each is a real new chance. NOT changed: the
+  nationwide raw data (nationwide_seen_ids.json) still records each ID only the first time.
+  Tested by `verify_listing_reappearance_alerts.py`.
+- **Fixed 2026-10-02: main_loop() wrote a stale startup snapshot of the state on every failed
+  cycle**, erasing every ID recorded since startup (confirmed: #2156 alerted 09-25 07:11, erased
+  by failure writes at 12:19-12:58, alerted again 09-27), and making "5 consecutive failures"
+  count since startup. Failures now go through `_record_cycle_failure()`, which re-reads the file.
 - crous_auth.py — Playwright headless login/session renewal (auto_login()), Altcha PoW solver,
   session.json read/write, check_session_status()/is_session_valid(). Audited — correct as-is.
 - session_keeper.py — lives at /home/ubuntu/session_keeper.py, OUTSIDE this git repo (untracked).
@@ -289,6 +312,13 @@ first real trigger, whenever it happens, is the true first live test.
    collected in `nationwide_listings_data.jsonl` so far — zero have ever hit this fallback path.
    Worth fixing on principle (same pattern as the surface fix), not because it's caused a
    real incident.
+10. **Test hygiene:** importing crous_watcher attaches a FileHandler to the LIVE watcher.log
+   (logging.basicConfig at import). Tests that don't first add a NullHandler to the root logger
+   (as verify_proxy_quarantine.py, verify_status_capabilities.py and
+   verify_listing_reappearance_alerts.py do) write fake lines — mocked alerts, MANUAL SNIPE
+   triggers — into the production log. 60 such lines from 2026-10-02 test runs were removed;
+   older runs may have left more. Use the journal (`journalctl -u crous-watcher`) as the source
+   of truth for analysis, or run other tests via a wrapper that adds the NullHandler first.
 
 ## Standing rules for all future work in this repo
 - Redact all secrets (passwords, tokens, API keys) in any output or log you produce.

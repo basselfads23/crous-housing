@@ -172,6 +172,15 @@ def _count_lines(path: Path) -> int:
         return 0
 
 
+def _count_marseille_appearances() -> int:
+    """Appearance lines in the Marseille data file (it also holds "gone" lines)."""
+    try:
+        with open(LISTINGS_DATA_FILE, "r", encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip() and json.loads(line).get("event", "appeared") == "appeared")
+    except Exception:
+        return 0
+
+
 def _format_bot_capabilities_text(paused: bool, keeper_state: str, has_credentials: bool) -> str:
     """
     Plain-language summary of what the bot does and does NOT do right now, built from
@@ -180,7 +189,7 @@ def _format_bot_capabilities_text(paused: bool, keeper_state: str, has_credentia
     """
     viewers = len(get_viewer_chat_ids())
     nationwide_n = _count_lines(NATIONWIDE_LISTINGS_DATA_FILE)
-    marseille_n = _count_lines(LISTINGS_DATA_FILE)
+    marseille_n = _count_marseille_appearances()
 
     does = []
     does_not = []
@@ -190,12 +199,13 @@ def _format_bot_capabilities_text(paused: bool, keeper_state: str, has_credentia
     else:
         does.append("✅ Recherche des offres CROUS (toute la France) via l'API publique — *sans connexion à ton compte*")
         does.append(
-            f"✅ Alerte Telegram pour chaque nouvelle offre à {TARGET_CITY.capitalize()} ≤ {MAX_PRICE:.0f} € "
-            f"(toi + {viewers} viewer{'s' if viewers != 1 else ''})"
+            f"✅ Alerte Telegram à chaque mise en ligne d'une offre à {TARGET_CITY.capitalize()} ≤ {MAX_PRICE:.0f} € "
+            f"(toi + {viewers} viewer{'s' if viewers != 1 else ''}) — y compris une offre déjà vue qui revient, "
+            f"une seule alerte tant qu'elle reste en ligne"
         )
         does.append(
-            f"✅ Collecte de données : {nationwide_n} offres France + {marseille_n} offres "
-            f"{TARGET_CITY.capitalize()} enregistrées, + heures de publication suivies"
+            f"✅ Collecte de données : {nationwide_n} offres France + {marseille_n} mises en ligne "
+            f"{TARGET_CITY.capitalize()} enregistrées (avec leur durée en ligne), + heures de publication suivies"
         )
 
     if AUTO_APPLY_ENABLED:
@@ -842,24 +852,31 @@ def send_test_notification():
 # ==============================================================================
 
 def load_state() -> dict:
-    """Load seen listing IDs from disk."""
-    if not STATE_FILE.exists():
-        return {"seen_ids": [], "consecutive_failures": 0}
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    """
+    Load watcher state from disk. Every key on disk is kept (not an allow-list), so a
+    load/modify/save round trip can never silently drop a field it doesn't know about.
+      seen_ids             -- every Marseille listing ID ever alerted (history only)
+      consecutive_failures -- failed cycles in a row (reset by each successful cycle)
+      active               -- listings currently considered online; see update_listing_visibility()
+      history              -- per-ID appearance count and when it last went offline
+    """
+    state = {}
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
             if isinstance(data, list):
-                return {"seen_ids": data, "consecutive_failures": 0}
+                state = {"seen_ids": data}
             elif isinstance(data, dict):
-                return {
-                    "seen_ids": data.get("seen_ids", []),
-                    "consecutive_failures": data.get("consecutive_failures", 0)
-                }
-    except Exception as err:
-        logger.warning(f"Error reading {STATE_FILE}: {err}. Resetting state.")
+                state = data
+        except Exception as err:
+            logger.warning(f"Error reading {STATE_FILE}: {err}. Resetting state.")
 
-    return {"seen_ids": [], "consecutive_failures": 0}
+    state.setdefault("seen_ids", [])
+    state.setdefault("consecutive_failures", 0)
+    state.setdefault("active", {})
+    state.setdefault("history", {})
+    return state
 
 
 def save_state(state: dict) -> None:
@@ -871,6 +888,71 @@ def save_state(state: dict) -> None:
         temp_file.replace(STATE_FILE)
     except Exception as err:
         logger.error(f"Failed to atomically save state to {STATE_FILE}: {err}")
+
+
+def _record_cycle_failure() -> int:
+    """
+    Increment consecutive_failures on the CURRENT on-disk state and return the new count.
+
+    main_loop() used to load the state once at startup and, on every failed cycle, save
+    that startup snapshot back -- silently erasing every listing ID check_and_notify()
+    had recorded since. Confirmed in production: #2156 was alerted 2026-09-25 07:11,
+    erased by the 12:19-12:58 failure writes of a 06:47 snapshot (absent from the
+    16:42 git snapshot of listings_seen.json), then alerted again 2026-09-27. The same
+    stale object also made the "5 consecutive failures" alert count failures since
+    startup rather than in a row, since check_and_notify()'s reset to 0 never reached it.
+    """
+    state = load_state()
+    state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+    save_state(state)
+    return state["consecutive_failures"]
+
+
+# A listing counts as gone (so its next appearance alerts again) only after it is
+# missing from this many COMPLETE checks in a row. One is not enough: the search API
+# has returned incomplete results without any error -- 53 -> 8 listings for one check
+# on 2026-09-30 00:00 UTC, and single-check Marseille dips (3 -> 2 -> 3) on 2026-10-02
+# -- and with a threshold of 1, each of those would have re-alerted every listing it
+# hid. Cost: a listing taken and re-posted within ~2 checks (~1-1.5 min at peak
+# cadence, ~8 min at night) doesn't get a second alert.
+LISTING_GONE_AFTER_MISSES = 2
+
+
+def update_listing_visibility(active: dict, present: dict, fetch_complete: bool, now_iso: str,
+                              gone_after_misses: int = LISTING_GONE_AFTER_MISSES) -> tuple[list, list]:
+    """
+    Track which matching listings are currently online, so an alert fires once per
+    APPEARANCE: when a listing comes online, never again while it stays online, and
+    again if it goes offline and later comes back (a re-posting -- previously these
+    were silently ignored forever, because seen_ids never forgets an ID).
+
+    active:  {id: {"since", "last_seen", "checks", "missed", ...snapshot}} -- mutated in place
+    present: {id: snapshot dict} for the matching listings seen in THIS check
+    fetch_complete: False if any part of this check's fetch failed; then absences are
+        not counted at all, since a missing listing may simply not have been fetched.
+
+    Returns (appeared_ids, gone) where gone is a list of (id, final active entry).
+    """
+    appeared = []
+    for lid, snapshot in present.items():
+        entry = active.get(lid)
+        if entry is None:
+            active[lid] = dict(snapshot, since=now_iso, last_seen=now_iso, checks=1, missed=0)
+            appeared.append(lid)
+        else:
+            entry.update(snapshot)
+            entry["last_seen"] = now_iso
+            entry["checks"] = entry.get("checks", 0) + 1
+            entry["missed"] = 0
+
+    gone = []
+    if fetch_complete:
+        for lid in [i for i in active if i not in present]:
+            entry = active[lid]
+            entry["missed"] = entry.get("missed", 0) + 1
+            if entry["missed"] >= gone_after_misses:
+                gone.append((lid, active.pop(lid)))
+    return appeared, gone
 
 
 def append_run_history(status: str, summary: str) -> None:
@@ -894,16 +976,25 @@ def append_run_history(status: str, summary: str) -> None:
         logger.error(f"Failed to write history log: {err}")
 
 
-def record_marseille_listing(info: dict, tool_id: str, listing_url: str) -> None:
+def record_marseille_listing(info: dict, tool_id: str, listing_url: str,
+                             appearance_no: int | None = 1, reappearance: bool = False) -> None:
     """
-    Append one line of raw structured data for every newly-seen Marseille listing,
-    regardless of price or whether it qualified for auto-apply. This is deliberately
+    Append one line of raw structured data for every Marseille listing APPEARANCE
+    (first time online, or back online after going offline -- see
+    update_listing_visibility()), regardless of price or whether it qualified for
+    auto-apply. This is deliberately
     unfiltered observational data (price, surface, room type, mode, coordinates,
     timestamp) so the sniper's price/surface tier thresholds can eventually be tuned
     against real market data instead of guessed at. Append-only JSONL (one JSON
-    object per line); never overwrites or trims previous entries.
+    object per line); never overwrites or trims previous entries. Lines written
+    before 2026-10-02 have no "event" field and are all first appearances.
+    appearance_no is None when the earlier count is unknown (ID seen before the
+    appearance tracking existed).
     """
     entry = {
+        "event": "appeared",
+        "appearance_no": appearance_no,
+        "reappearance": reappearance,
         "seen_at": datetime.now(timezone.utc).isoformat(),
         "id": info.get("id"),
         "tool_id": tool_id,
@@ -924,6 +1015,55 @@ def record_marseille_listing(info: dict, tool_id: str, listing_url: str) -> None
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as err:
         logger.error(f"Failed to record listing data: {err}")
+
+
+def _format_reappearance_line(appearance_no: int | None, last_seen_online_iso: str | None, now_iso: str) -> str:
+    """Telegram line telling the reader this listing was already posted before."""
+    if not appearance_no:
+        return "🔁 *Déjà vue :* oui, avant le suivi des apparitions"
+    text = f"🔁 *Déjà vue :* {appearance_no}ᵉ apparition"
+    try:
+        secs = (datetime.fromisoformat(now_iso) - datetime.fromisoformat(last_seen_online_iso)).total_seconds()
+        if secs < 3600:
+            ago = f"{max(1, round(secs / 60))} min"
+        elif secs < 48 * 3600:
+            ago = f"{round(secs / 3600)} h"
+        else:
+            ago = f"{round(secs / 86400)} jours"
+        text += f" (dernière fois en ligne il y a {ago})"
+    except Exception:
+        pass
+    return text
+
+
+def record_marseille_listing_gone(listing_id: str, entry: dict, detected_at_iso: str) -> None:
+    """
+    Append a "gone" line to the same file when a listing goes offline, closing the
+    matching "appeared" line. online_seconds = last check that saw it minus the first,
+    so 0 means it was online for a single check only (i.e. less than one check interval).
+    """
+    since, last_seen = entry.get("since"), entry.get("last_seen")
+    try:
+        online_seconds = round((datetime.fromisoformat(last_seen) - datetime.fromisoformat(since)).total_seconds())
+    except Exception:
+        online_seconds = None
+    line = {
+        "event": "gone",
+        "id": listing_id,
+        "appeared_at": since,
+        "last_seen_at": last_seen,
+        "gone_detected_at": detected_at_iso,
+        "online_seconds": online_seconds,
+        "checks_seen": entry.get("checks"),
+        "residence_name": entry.get("residence_name"),
+        "label": entry.get("label"),
+        "price": entry.get("price"),
+    }
+    try:
+        with open(LISTINGS_DATA_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    except Exception as err:
+        logger.error(f"Failed to record listing gone event: {err}")
 
 
 def record_nationwide_listing_raw(item: dict, tool_id: str) -> None:
@@ -1590,10 +1730,12 @@ def check_and_notify() -> tuple[int, int]:
     """
     Core check cycle:
     1. Fetches listings from active CROUS tool(s).
-    2. Identifies new matching listings in Marseille.
-    3. Triggers immediate auto-apply if rent <= AUTO_APPLY_MAX_PRICE (330€).
-    4. Sends Telegram alert (with sniper screenshot if applied, or manual link if 330-400€).
-    5. Updates listings_seen.json.
+    2. Identifies matching Marseille listings that just came online -- first time ever,
+       or back after going offline (update_listing_visibility()). One alert per
+       appearance: never repeated while a listing stays online.
+    3. Triggers immediate auto-apply if the listing qualifies (is_target_listing()).
+    4. Sends Telegram alert (with sniper screenshot if applied, or manual link otherwise).
+    5. Updates listings_seen.json (seen_ids, active, history).
     6. Records posting-activity stats (first/last new listing seen today, nationwide
        and Marseille) to posting_activity.json, for eventually tuning smart-cadence
        "peak hours" against real data instead of an assumption.
@@ -1601,6 +1743,8 @@ def check_and_notify() -> tuple[int, int]:
     """
     state = load_state()
     seen_ids = set(str(i) for i in state.get("seen_ids", []))
+    active = state["active"]
+    history = state["history"]
 
     if proxy_manager:
         available_groups = proxy_manager.get_available_groups()
@@ -1664,6 +1808,30 @@ def check_and_notify() -> tuple[int, int]:
     matching_listings = []
     new_alerts_sent = 0
 
+    # Which matching listings are online right now -> which just APPEARED (alert) and
+    # which just went offline (record). See update_listing_visibility().
+    present = {}
+    for item in all_raw_items:
+        matches, info = is_target_listing(item)
+        if matches and info["id"] not in present:
+            present[info["id"]] = {
+                "residence_name": info.get("residence_name"),
+                "label": info.get("label"),
+                "price": info.get("price"),
+            }
+    now_iso = datetime.now(timezone.utc).isoformat()
+    appeared, gone = update_listing_visibility(
+        active, present, fetch_complete=not errors_encountered, now_iso=now_iso
+    )
+    for gone_id, gone_entry in gone:
+        history.setdefault(gone_id, {})["last_gone_at"] = gone_entry.get("last_seen")
+        record_marseille_listing_gone(gone_id, gone_entry, now_iso)
+        logger.info(
+            f"👋 Listing #{gone_id} ({gone_entry.get('residence_name')}) went offline "
+            f"(seen in {gone_entry.get('checks')} check(s) since {gone_entry.get('since')})"
+        )
+    to_alert = set(appeared)
+
     for item in all_raw_items:
         matches, info = is_target_listing(item)
         if matches:
@@ -1671,19 +1839,36 @@ def check_and_notify() -> tuple[int, int]:
             item_id = info["id"]
             tool_id = item.get("_tool_id", "47")
 
-            if item_id not in seen_ids:
-                # NEW LISTING FOUND!
+            if item_id in to_alert:
+                # LISTING JUST CAME ONLINE -- first time ever, or back after going offline.
+                to_alert.discard(item_id)  # once per appearance, even if the API repeats an item
+                hist = history.setdefault(item_id, {})
+                count_known = "appearances" in hist
+                reappearance = count_known or item_id in seen_ids
+                hist["appearances"] = hist.get("appearances", 1 if item_id in seen_ids else 0) + 1
+                appearance_no = hist["appearances"] if (count_known or not reappearance) else None
+
                 mode_name = "Colocation" if info["is_coloc"] else "Individuel"
                 is_sniper_target = info["should_auto_apply"] and bool(apply_for_accommodation)
-                logger.info(f"✨ NEW LISTING: {info['residence_name']} ({info['price']}€) | Sniper Target: {is_sniper_target}")
+                logger.info(
+                    f"✨ {'LISTING BACK ONLINE' if reappearance else 'NEW LISTING'}: {info['residence_name']} "
+                    f"({info['price']}€) | appearance #{appearance_no or '?'} | Sniper Target: {is_sniper_target}"
+                )
                 listing_url = f"https://trouverunlogement.lescrous.fr/tools/{tool_id}/accommodations/{item_id}"
-                record_marseille_listing(info, tool_id, listing_url)
+                record_marseille_listing(info, tool_id, listing_url,
+                                         appearance_no=appearance_no, reappearance=reappearance)
                 coloc_tag = " [Colocation]" if info["is_coloc"] else ""
+                reappearance_line = (
+                    _format_reappearance_line(appearance_no, hist.get("last_gone_at"), now_iso) + "\n"
+                    if reappearance else ""
+                )
 
                 # 1. SEND DIRECT LINK IMMEDIATELY so the user can apply manually without delay
                 logger.info(f"⚡ [IMMEDIATE ALERT] Sending listing #{item_id} link to Telegram first...")
                 alert_text = (
-                    "🚨 *NOUVELLE OFFRE CROUS TROUVÉE !*\n\n"
+                    ("🔁 *OFFRE CROUS DE NOUVEAU DISPONIBLE !*\n\n" if reappearance
+                     else "🚨 *NOUVELLE OFFRE CROUS TROUVÉE !*\n\n")
+                    + reappearance_line +
                     f"📍 *Résidence :* {info['residence_name']}\n"
                     f"🏷️ *Type :* {info['label']}{coloc_tag} ({info['surface']} m²)\n"
                     f"👤 *Mode :* {mode_name}\n"
@@ -1773,6 +1958,8 @@ def check_and_notify() -> tuple[int, int]:
 
     # Update state
     state["seen_ids"] = list(seen_ids)
+    state["active"] = active
+    state["history"] = history
     state["consecutive_failures"] = 0
     save_state(state)
 
@@ -1876,7 +2063,6 @@ def main_loop():
         logger.error("FATAL: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing from .env!")
         sys.exit(1)
 
-    state = load_state()
     last_heartbeat_day = None
 
     # Send startup announcement to Telegram
@@ -1922,15 +2108,14 @@ def main_loop():
 
         except AllProxyGroupsExhaustedError as err:
             logger.critical(f"ALL PROXY GROUPS EXHAUSTED: {err}")
-            state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
-            save_state(state)
-            append_run_history("EXHAUSTED", f"{err} | Consecutive: {state['consecutive_failures']}")
+            failures = _record_cycle_failure()
+            append_run_history("EXHAUSTED", f"{err} | Consecutive: {failures}")
             if activity_logger:
                 activity_logger.notify_general_error(
                     "Tous les groupes de proxys sont épuisés (402 Payment Required). Aucun proxy sain disponible.",
                     component_name="Scouter"
                 )
-            if state["consecutive_failures"] == 5:
+            if failures == 5:
                 send_telegram_message(
                     f"🚨 *Alerte Watcher : 5 échecs consécutifs*\n\n"
                     f"Dernière erreur : `Tous les groupes de proxys sont épuisés (402)`\n"
@@ -1940,8 +2125,7 @@ def main_loop():
         except CrousBlockedOrRateLimitedError as err:
             is_blocked_error = True
             logger.exception(f"Rate limited or blocked: {err}")
-            state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
-            save_state(state)
+            failures = _record_cycle_failure()
             append_run_history("BLOCKED", str(err))
             if activity_logger:
                 activity_logger.notify_general_error(
@@ -1966,12 +2150,11 @@ def main_loop():
                         f"Erreur inattendue dans le cycle : {err}",
                         component_name="Watcher"
                     )
-            state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
-            save_state(state)
-            append_run_history("FAILURE", f"{err} | Consecutive: {state['consecutive_failures']}")
+            failures = _record_cycle_failure()
+            append_run_history("FAILURE", f"{err} | Consecutive: {failures}")
 
             # Alert after 5 consecutive failures
-            if state["consecutive_failures"] == 5:
+            if failures == 5:
                 send_telegram_message(
                     f"🚨 *Alerte Watcher : 5 échecs consécutifs*\n\n"
                     f"Dernière erreur : `{str(err)[:200]}`\n"
