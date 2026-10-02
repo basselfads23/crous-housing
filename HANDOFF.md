@@ -43,8 +43,9 @@ the 🎯 Snipe button (shown on EVERY alert while auto-apply is off, and LIVE), 
   2026-10-02 10:44 got nothing, and the viewer saw ~6 listings online while the owner got 2 alerts.
   Now `update_listing_visibility()` keeps `active` (online now) + `history` (appearance counts)
   in listings_seen.json: alert when a listing comes online, never again while it stays online,
-  and again (as "🔁 OFFRE DE NOUVEAU DISPONIBLE", with its appearance number) after it goes
-  offline and comes back. "Offline" = missing from `LISTING_GONE_AFTER_MISSES` (2) COMPLETE
+  and again after it goes offline and comes back. The Telegram alert is IDENTICAL either way
+  (user's call 2026-10-02: a re-posted room is just as bookable, and a "seen before" label reads
+  as "skip this one") — whether it's a re-appearance lives only in the data file and the log. "Offline" = missing from `LISTING_GONE_AFTER_MISSES` (2) COMPLETE
   checks in a row; a check where any tool fetch failed never counts as missing. Why 2, not 1:
   the API has returned incomplete results with no error (France 53 -> 8 for one check,
   2026-09-30 00:00 UTC; Marseille 3 -> 2 -> 3 twice on 2026-10-02) — with 1, each such glitch

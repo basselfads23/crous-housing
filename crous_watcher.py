@@ -1017,25 +1017,6 @@ def record_marseille_listing(info: dict, tool_id: str, listing_url: str,
         logger.error(f"Failed to record listing data: {err}")
 
 
-def _format_reappearance_line(appearance_no: int | None, last_seen_online_iso: str | None, now_iso: str) -> str:
-    """Telegram line telling the reader this listing was already posted before."""
-    if not appearance_no:
-        return "🔁 *Déjà vue :* oui, avant le suivi des apparitions"
-    text = f"🔁 *Déjà vue :* {appearance_no}ᵉ apparition"
-    try:
-        secs = (datetime.fromisoformat(now_iso) - datetime.fromisoformat(last_seen_online_iso)).total_seconds()
-        if secs < 3600:
-            ago = f"{max(1, round(secs / 60))} min"
-        elif secs < 48 * 3600:
-            ago = f"{round(secs / 3600)} h"
-        else:
-            ago = f"{round(secs / 86400)} jours"
-        text += f" (dernière fois en ligne il y a {ago})"
-    except Exception:
-        pass
-    return text
-
-
 def record_marseille_listing_gone(listing_id: str, entry: dict, detected_at_iso: str) -> None:
     """
     Append a "gone" line to the same file when a listing goes offline, closing the
@@ -1858,17 +1839,14 @@ def check_and_notify() -> tuple[int, int]:
                 record_marseille_listing(info, tool_id, listing_url,
                                          appearance_no=appearance_no, reappearance=reappearance)
                 coloc_tag = " [Colocation]" if info["is_coloc"] else ""
-                reappearance_line = (
-                    _format_reappearance_line(appearance_no, hist.get("last_gone_at"), now_iso) + "\n"
-                    if reappearance else ""
-                )
 
                 # 1. SEND DIRECT LINK IMMEDIATELY so the user can apply manually without delay
                 logger.info(f"⚡ [IMMEDIATE ALERT] Sending listing #{item_id} link to Telegram first...")
+                # Same alert whether or not it was seen before: a re-posted room is just as
+                # bookable, and a "seen before" label reads as "skip this one". Whether it is a
+                # re-appearance is recorded in the data file and the log line above instead.
                 alert_text = (
-                    ("🔁 *OFFRE CROUS DE NOUVEAU DISPONIBLE !*\n\n" if reappearance
-                     else "🚨 *NOUVELLE OFFRE CROUS TROUVÉE !*\n\n")
-                    + reappearance_line +
+                    "🚨 *NOUVELLE OFFRE CROUS TROUVÉE !*\n\n"
                     f"📍 *Résidence :* {info['residence_name']}\n"
                     f"🏷️ *Type :* {info['label']}{coloc_tag} ({info['surface']} m²)\n"
                     f"👤 *Mode :* {mode_name}\n"

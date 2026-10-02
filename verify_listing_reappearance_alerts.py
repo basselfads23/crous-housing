@@ -4,11 +4,12 @@ verify_listing_reappearance_alerts.py — run with: venv/bin/python3 verify_list
 Verifies "one alert per appearance" (update_listing_visibility() + check_and_notify()):
 - a listing alerts when it comes online, and NOT again while it stays online
 - a listing that goes offline (missing from 2 complete checks in a row) and comes back
-  alerts again, marked as a re-appearance with its appearance number
+  alerts again, with the SAME alert text as a brand-new listing (no "seen before" label);
+  the re-appearance and its appearance number are recorded in the data file only
 - a one-check disappearance (the API returned incomplete results without error:
   53 -> 8 listings on 2026-09-30 00:00 UTC) does NOT cause a second alert
 - a check where part of the fetch failed never counts as "missing"
-- an ID seen before this feature existed (legacy seen_ids) alerts as "already seen"
+- an ID seen before this feature existed (legacy seen_ids) alerts like any other
 - duplicate items in one API response alert once
 - each appearance and each disappearance is recorded in the Marseille data file
 - regression for the stale-state bug: a failed cycle no longer erases IDs recorded
@@ -153,6 +154,7 @@ class TestCheckAndNotifyReappearance(unittest.TestCase):
         self.assertEqual(len(out), 2)
         self.assertIn("NOUVELLE OFFRE", out[0])
         self.assertEqual([c for c, _ in self.sent], [None, "viewer"])
+        first_alert = out[0]
         # 2. stays online, including a duplicated item in one response -> nothing
         self.assertEqual(self.check(A), [])
         self.assertEqual(self.check(A, A), [])
@@ -166,13 +168,12 @@ class TestCheckAndNotifyReappearance(unittest.TestCase):
         self.assertEqual(len(gone), 1)
         self.assertEqual(gone[0]["id"], "1165")
         self.assertEqual(gone[0]["checks_seen"], 4)
-        # 5. comes back -> alerted again, marked as a re-appearance
+        # 5. comes back -> alerted again, exactly like a new listing
         out = self.check(A)
         self.assertEqual(len(out), 2)
         print("\n----- re-appearance alert as sent -----\n" + out[0] + "\n---------------------------------------")
-        self.assertIn("DE NOUVEAU DISPONIBLE", out[0])
-        self.assertIn("2ᵉ apparition", out[0])
-        self.assertIn("dernière fois en ligne il y a", out[0])
+        self.assertEqual(out[0], first_alert, "re-appearance alert must be identical to the first one")
+        self.assertNotIn("Déjà vue", out[0])
         self.assertEqual(out[0], out[1], "viewer gets the same text")
         # 6. and again not repeated while it stays up
         self.assertEqual(self.check(A), [])
@@ -192,18 +193,22 @@ class TestCheckAndNotifyReappearance(unittest.TestCase):
         self.assertEqual(self.check(A), [], "absent only in checks where a tool failed -> still the same appearance")
         self.assertEqual([l for l in self.data_lines() if l.get("event") == "gone"], [])
 
-    def test_legacy_seen_id_alerts_as_already_seen(self):
+    def test_legacy_seen_id_alerts_like_any_other(self):
         # B was alerted before this feature existed: in seen_ids, no history
         (self.tmp / "listings_seen.json").write_text(json.dumps({"seen_ids": ["2168"], "consecutive_failures": 0}))
         out = self.check(B)
         self.assertEqual(len(out), 2, "previously silenced forever -- must alert now")
-        self.assertIn("DE NOUVEAU DISPONIBLE", out[0])
-        self.assertIn("avant le suivi des apparitions", out[0])
-        self.assertEqual(self.data_lines()[-1]["appearance_no"], None)
-        # next re-appearance has a known (lower-bound) count
+        self.assertIn("NOUVELLE OFFRE", out[0])
+        self.assertNotIn("Déjà vue", out[0])
+        last = self.data_lines()[-1]
+        self.assertEqual((last["reappearance"], last["appearance_no"]), (True, None),
+                         "data says: seen before, earlier count unknown")
+        # next re-appearance has a known (lower-bound) count -- in the data, not the alert
         self.check(); self.check()
         out = self.check(B)
-        self.assertIn("3ᵉ apparition", out[0])
+        self.assertNotIn("Déjà vue", out[0])
+        last = self.data_lines()[-1]
+        self.assertEqual((last["reappearance"], last["appearance_no"]), (True, 3))
 
     def test_two_listings_independent(self):
         out = self.check(A, B)
