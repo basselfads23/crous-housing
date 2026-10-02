@@ -6,11 +6,20 @@ Read this entire file before touching anything. Do not skip to a task without re
 Python daemon on a VPS (systemd, user ubuntu, venv at ~/crous-housing/venv) that watches CROUS
 student housing listings in Marseille and auto-applies to good ones.
 
-**⚠️ LIVE SNIPING IS ACTIVE as of 2026-09-26.** `AUTO_APPLY_ENABLED=true` and
-`AUTO_APPLY_DRY_RUN=false` in `.env`. On a qualifying Marseille listing, the bot now actually
-submits a real booking request to CROUS — this is no longer a screenshot-only dry run. Treat
+**Auto-apply is currently OFF** (`AUTO_APPLY_ENABLED=false` in `.env`; `AUTO_APPLY_DRY_RUN=false`).
+Live sniping ran from 2026-09-26 until the user turned it off. When it's on, a qualifying Marseille
+listing gets a real booking request submitted to CROUS — not a screenshot-only dry run. Treat
 anything touching the auto-apply trigger logic (`is_target_listing`), the apply flow
-(`crous_apply.py`), or proxy selection as live-production-risk from now on, not a safe sandbox.
+(`crous_apply.py`), or proxy selection as live-production-risk, not a safe sandbox.
+
+**session-keeper.service is STOPPED and DISABLED (2026-10-02).** While running it does a full
+headless login every ~20 min ("aged" renewal, even when the session is still valid), each through a
+different residential proxy IP, so MesServices emailed the user a "new sign-in" alert ~70x/day.
+`session_keeper.py` now also re-reads `AUTO_APPLY_ENABLED` from `.env` every cycle and idles (no
+session check, no login) while it's false. **To turn sniping back on:** set
+`AUTO_APPLY_ENABLED=true`, restart crous-watcher.service, and
+`sudo systemctl enable --now session-keeper.service` — otherwise the session expires and snipes
+(including the manual Telegram "Snipe" button) fail until a `/renew`.
 
 ## Architecture
 - crous_watcher.py — main polling loop, Telegram bot (commands + the owner-only "Snipe" button),
@@ -28,6 +37,8 @@ anything touching the auto-apply trigger logic (`is_target_listing`), the apply 
   Audited (read-only): reuses crous_auth.auto_login()/check_session_status() directly (so it
   automatically benefits from the residential-proxy auth fix below), writes session.json only via
   crous_auth's atomic write, never touches proxy_manager's index files directly. Confirmed safe.
+  Gated on AUTO_APPLY_ENABLED (re-read from .env each cycle; idles when false) since 2026-10-02 —
+  see the header note. Backup of the pre-gate version: ~/session_keeper.py.bak-2026-10-02.
   Bringing it into the repo is still a nice-to-have, not urgent.
 - proxy_manager.py — TWO pools, THREE deliberately isolated selection systems:
   - **Datacenter pool** (proxies.txt, gitignored, real credentials): Webshare "Proxy Server" plan,
