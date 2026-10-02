@@ -21,6 +21,12 @@ session check, no login) while it's false. **To turn sniping back on:** set
 `sudo systemctl enable --now session-keeper.service` — otherwise the session expires and snipes
 (including the manual Telegram "Snipe" button) fail until a `/renew`.
 
+The user has a room now; the bot's job is **data collection only**. `.env` is deliberately left as
+is (credentials present, `AUTO_APPLY_DRY_RUN=false`) at the user's call. Telegram `/status` lists
+what the bot does and does NOT do (`_format_bot_capabilities_text()`, tested by
+`verify_status_capabilities.py`), including the manual actions that still log in to the account:
+the 🎯 Snipe button (shown on EVERY alert while auto-apply is off, and LIVE), `/renew`, `/test_apply`.
+
 ## Architecture
 - crous_watcher.py — main polling loop, Telegram bot (commands + the owner-only "Snipe" button),
   fetch_all_crous_listings(), discover_tool_ids() (cached hourly), check_and_notify(), main_loop().
