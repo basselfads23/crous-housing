@@ -347,6 +347,30 @@ first real trigger, whenever it happens, is the true first live test.
    older runs may have left more. Use the journal (`journalctl -u crous-watcher`) as the source
    of truth for analysis, or run other tests via a wrapper that adds the NullHandler first.
 
+11. **Pagination mixes two result orders — found 2026-10-04, NOT fixed yet (awaiting user OK).**
+   The search API returns the listing set in one of two orders, chosen per page REQUEST. When a
+   fetch's pages mix orders, some offers come back twice and others not at all: measured 2 of 6
+   test fetches (plus the bot's own fetch at 2026-10-04 00:47:54) returned 56 items but only 43
+   distinct offers. The "N in France" log counts items, not distinct offers, so it never showed.
+   Consequences: a Marseille offer online for one check has a real chance of never being alerted;
+   offers online for a long time can produce false gone/available pairs (and, for Marseille, a
+   duplicate alert) when two consecutive fetches miss them; nationwide tracking recorded 13 FALSE
+   "appeared" lines at 2026-10-04 00:52:01 (ids 1125 1184 1197 1211 1224 1268 1569 2240 2273 2441
+   2450 2477 2545 — online all along, missed by the seed fetch). Fix ready to build: the API
+   accepts `{"page": 1, "pageSize": 100}` and returned all 56 distinct offers in ONE request
+   (`size`/`perPage`/`limit` are ignored), so one request per check instead of 3 and no mixing;
+   plus treat a fetch with fewer distinct offers than `total.value` as incomplete; plus remove the
+   13 false lines and mark those offers as online-before-tracking.
+12. **3 dead scouter proxies, NOT removed yet (awaiting user OK):** 103.101.90.197:6462,
+   103.99.33.246:6241, 23.27.203.233:6968. They account for ALL 15 quarantine benches since
+   2026-09-28, every one `407 Proxy Authentication Required`, each re-benched ~24-28h apart (i.e.
+   failed on first use after every release; never one success). A probe on 2026-10-04 got 407 from
+   all 3 even for https://example.com while a healthy pool proxy got 200 — the PROVIDER rejects our
+   account on those IPs (likely replaced by Webshare), not a CROUS block. No proxy has ever been
+   benched for a CROUS-side reason; other proxy errors (timeouts, 502/503) recovered on their own.
+   Suggested: comment them out of proxies.txt and re-download the current list from the Webshare
+   dashboard (the plan may hold 3 replacement IPs that aren't in proxies.txt).
+
 ## Standing rules for all future work in this repo
 - Redact all secrets (passwords, tokens, API keys) in any output or log you produce.
 - Never introduce a silent fallback to an unproxied/direct connection anywhere auth or apply is
