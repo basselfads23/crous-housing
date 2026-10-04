@@ -101,11 +101,20 @@ the 🎯 Snipe button (shown on EVERY alert while auto-apply is off, and LIVE), 
     200 proxies + 5 Oxylabs, $5.98/mo, 250GB included. Used by the scouter
     (get_current_proxy()/rotate_proxy(), group-aware exhaustion on HTTP 402, 24h TTL) and — found
     2026-09-26, previously undocumented — by crous_auth.check_session_status() (see STILL OPEN #7).
-    9 of the original 200 confirmed dead (connection timeouts, not CROUS-side) and commented out
-    2026-09-25 — 196 confirmed healthy against the real search API. A 10th, 82.22.214.251:6103, was
-    commented out 2026-09-26: it answered 502 Bad Gateway to CONNECT tunnels to
-    trouverunlogement.lescrous.fr (3/3 tries, instantly) while reaching example.com fine and other
-    proxies reached CROUS fine → **195 active**. Backup: proxies.txt.bak-2026-09-26. A live
+    9 of the original 200 time out against CROUS and were commented out 2026-09-25. **Corrected
+    2026-10-04: these ARE CROUS-side** — all 9 reach https://example.com fine (200 in <4s) but still
+    time out on the CROUS search API 9 days later, and Webshare marks them valid: CROUS silently
+    drops them, most likely a block inherited with the shared plan (they failed on its first day).
+    A 10th, 82.22.214.251:6103, answered 502 to CROUS 2026-09-26 and was commented out; it works
+    again (re-enabled 2026-10-04) — so CROUS blocks are not always permanent. Also 2026-10-04: the 3
+    proxies Webshare auto-replaced on 2026-09-28 (see STILL OPEN #12) were swapped for their
+    replacements → **191 Webshare + 5 Oxylabs = 196 active**. Backups: proxies.txt.bak-2026-09-26,
+    proxies.txt.bak-2026-10-04. proxies.txt is a STATIC file: the bot never calls Webshare, so
+    future auto-replacements (`auto_replace_invalid_proxies` is on for the plan) must be copied in
+    by hand until a sync exists. Webshare API: one account-wide key (WEBSHARE_API_KEY in .env), the
+    plan is chosen per call — datacenter "proxy_server_shared" plan_id 14397141 (200 proxies),
+    residential plan_id 14397115 (20, renews 2026-10-25); the proxy-list endpoint without plan_id
+    returns the residential plan. A Webshare MCP server is also connected in Claude Code. A live
     interval test found zero errors down to 15s between polls and 1.0-1.5s between paginated
     requests (see below). The scouter takes ONE proxy per cycle (main_loop rotates each cycle), so
     one full lap of the pool ≈ 196 cycles ≈ 78 min at peak cadence — that's why a bad proxy's
@@ -361,15 +370,16 @@ first real trigger, whenever it happens, is the true first live test.
    00:52:01) were removed and those offers marked online-before-tracking. Tested in
    verify_offer_availability_alerts.py (mutation-checked: without the completeness check the
    mixed-order test fails with a duplicate alert).
-12. **3 dead scouter proxies, NOT removed yet (awaiting user OK):** 103.101.90.197:6462,
-   103.99.33.246:6241, 23.27.203.233:6968. They account for ALL 15 quarantine benches since
-   2026-09-28, every one `407 Proxy Authentication Required`, each re-benched ~24-28h apart (i.e.
-   failed on first use after every release; never one success). A probe on 2026-10-04 got 407 from
-   all 3 even for https://example.com while a healthy pool proxy got 200 — the PROVIDER rejects our
-   account on those IPs (likely replaced by Webshare), not a CROUS block. No proxy has ever been
-   benched for a CROUS-side reason; other proxy errors (timeouts, 502/503) recovered on their own.
-   Suggested: comment them out of proxies.txt and re-download the current list from the Webshare
-   dashboard (the plan may hold 3 replacement IPs that aren't in proxies.txt).
+12. **RESOLVED 2026-10-04: 3 dead scouter proxies** (103.101.90.197:6462, 103.99.33.246:6241,
+   23.27.203.233:6968) caused ALL 15 quarantine benches since 2026-09-28, every one `407 Proxy
+   Authentication Required`, re-benched ~24-28h apart (failed on first use after every release).
+   Cause, from Webshare's replacement history: Webshare auto-invalidated and replaced all 3 on
+   2026-09-28 (13:07 and 22:19 UTC — the first benches followed within hours), but proxies.txt is
+   static so the bot kept using the removed addresses. Swapped for the replacements
+   (91.124.253.200:6560, 154.6.128.186:6156, 82.26.242.53:6872 — each tested OK against the CROUS
+   API). Open: (a) a periodic sync of proxies.txt from the Webshare API, so replacements arrive
+   automatically; (b) the plan has 10 free manual replacements — could swap the 9 CROUS-blocked
+   proxies for fresh ones (they may come pre-blocked too). Both need the user's OK.
 
 ## Standing rules for all future work in this repo
 - Redact all secrets (passwords, tokens, API keys) in any output or log you produce.
