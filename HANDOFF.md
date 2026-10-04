@@ -370,6 +370,24 @@ first real trigger, whenever it happens, is the true first live test.
    00:52:01) were removed and those offers marked online-before-tracking. Tested in
    verify_offer_availability_alerts.py (mutation-checked: without the completeness check the
    mixed-order test fails with a duplicate alert).
+13. **Webshare sync + escalating quarantine — BUILT 2026-10-04, NOT YET DEPLOYED (awaiting user OK).**
+   Code is committed but inert until `.env` has `WEBSHARE_SYNC_ENABLED=true` and
+   `WEBSHARE_DATACENTER_PLAN_ID=14397141`. Design: proxy_manager.sync_webshare_proxies() writes the
+   plan's VALID proxies to proxies_webshare.txt (gitignored, generated — never edit) every 12 h, and
+   within the hour after any 407; never more than 1 API call/hour; on ANY failure (API error, empty
+   list, list < half the current one) the current file is kept, and the 3rd failure in a row alerts
+   on Telegram. load_proxies() = proxies.txt (hand-managed: Oxylabs) + proxies_webshare.txt (the
+   synced file sits next to PROXIES_FILE, so tests that redirect PROXIES_FILE stay isolated).
+   Quarantine entries of proxies that leave the plan are dropped at sync; benches of proxies still
+   listed are kept. Benches escalate per proxy: 1, 2, 4, 7 days (cap) for consecutive benches
+   without a success in between (`bench_count`); any success clears it; probation unchanged (one
+   failure after a bench re-benches). proxy_manager.bench_proxy(key, reason, bench_count) benches
+   by hand. Telegram only on a proxy's FIRST bench; re-benches are logged. /status shows the last
+   sync and the benched count. Deploy plan: stop watcher → real first sync → bench the 9
+   CROUS-blocked proxies at bench_count=4 (7 days) so the sync can't put them back in rotation →
+   strip the Webshare section from proxies.txt (backup) → set the 2 .env lines → start → verify.
+   Tested: verify_webshare_sync.py (21 tests, incl. a replay of the 2026-09-28 replacement) +
+   a live sync against the real API into a temp dir (200 proxies, replacements in, dead ones out).
 12. **RESOLVED 2026-10-04: 3 dead scouter proxies** (103.101.90.197:6462, 103.99.33.246:6241,
    23.27.203.233:6968) caused ALL 15 quarantine benches since 2026-09-28, every one `407 Proxy
    Authentication Required`, re-benched ~24-28h apart (failed on first use after every release).

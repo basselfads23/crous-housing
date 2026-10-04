@@ -175,6 +175,23 @@ def _count_availabilities(path: Path) -> int:
         return 0
 
 
+def _format_proxy_maintenance_line() -> str:
+    """/status line: when the Webshare list was last synced and how many proxies are benched."""
+    if not proxy_manager:
+        return "🔄 *Liste de proxies :* gestionnaire indisponible"
+    try:
+        benched = len(proxy_manager.get_quarantined_proxies())
+        if not proxy_manager.webshare_sync_enabled():
+            return f"🔄 *Liste Webshare :* synchro désactivée — {benched} proxy(s) en quarantaine"
+        st = proxy_manager.get_webshare_sync_state()
+        last = st.get("last_success_at")
+        when = f"il y a {proxy_manager.format_duration(time.time() - float(last))}" if last else "jamais"
+        fail = f", ⚠️ {st['consecutive_failures']} échec(s) depuis" if st.get("consecutive_failures") else ""
+        return f"🔄 *Liste Webshare :* synchronisée {when}{fail} — {benched} proxy(s) en quarantaine"
+    except Exception:
+        return "🔄 *Liste Webshare :* état illisible"
+
+
 def _format_bot_capabilities_text(paused: bool, keeper_state: str, has_credentials: bool) -> str:
     """
     Plain-language summary of what the bot does and does NOT do right now, built from
@@ -703,6 +720,7 @@ def handle_telegram_command(cmd: str, on_check_callback=None):
             f"🕒 *Dernière vérification :* {last_check}\n"
             f"⏱️ *Cadence :* ~{interval}s ({cadence_label})\n"
             f"🌐 *Proxies :* {total_proxies} actifs (Actuel : `{proxy_display}`)\n"
+            f"{_format_proxy_maintenance_line()}\n"
             f"🇫🇷 *Offres actives en France :* {METRICS['last_active_listings_count']}\n"
             f"💾 *Offres déjà enregistrées :* {len(state.get('seen_ids', []))}\n"
             f"⚠️ *Échecs consécutifs :* {state.get('consecutive_failures', 0)}\n\n"
@@ -1389,16 +1407,26 @@ def _settle_proxy_health(working_proxy: str | None, failed_proxies: list) -> Non
             blamed.add(failed_key)
             result = proxy_manager.record_proxy_strike(failed_url, reason)
             safe_reason = str(reason).replace("`", "'")[:120]
+            if "407" in str(reason):
+                # 407 = Webshare no longer accepts this address for our account (replaced/removed
+                # from the plan): fetch the current list within the hour instead of waiting 12 h.
+                proxy_manager.request_webshare_sync(f"407 from {failed_key}")
             if result["quarantined_now"]:
                 limit = proxy_manager.PROXY_STRIKE_LIMIT
-                logger.warning(f"Proxy {failed_key} benched for 24h after {limit} consecutive failures ({safe_reason})")
-                send_telegram_message(
-                    "🚫 *[Alerte Proxy - Proxy mis de côté]*\n\n"
-                    f"• *Proxy :* `{failed_key}`\n"
-                    f"• *Raison :* `{limit} échecs consécutifs (dernier : {safe_reason})`\n"
-                    f"• *Proxys non écartés :* {result['pool_size'] - result['benched_count']}/{result['pool_size']}\n"
-                    "• *Action :* Exclu du scouter pendant 24h, puis un dernier essai."
+                duration = proxy_manager.format_duration(result["bench_seconds"])
+                logger.warning(
+                    f"Proxy {failed_key} benched for {duration} (bench #{result['bench_count']} in a row) "
+                    f"after {limit} consecutive failures ({safe_reason})"
                 )
+                if result["bench_count"] == 1:  # re-benches of the same proxy are logged only
+                    send_telegram_message(
+                        "🚫 *[Alerte Proxy - Proxy mis de côté]*\n\n"
+                        f"• *Proxy :* `{failed_key}`\n"
+                        f"• *Raison :* `{limit} échecs consécutifs (dernier : {safe_reason})`\n"
+                        f"• *Proxys non écartés :* {result['pool_size'] - result['benched_count']}/{result['pool_size']}\n"
+                        f"• *Action :* Exclu du scouter pendant {duration}, puis un dernier essai "
+                        "(s'il échoue encore : 2, 4 puis 7 jours)."
+                    )
             elif result["blocked_by_floor"]:
                 logger.warning(f"Proxy {failed_key} reached the strike limit but was NOT benched: quarantine cap reached")
                 if activity_logger:
@@ -1825,6 +1853,39 @@ def build_alert_markups(
     return owner_markup, viewer_markup
 
 
+def _maybe_sync_webshare_proxies() -> None:
+    """Run proxy_manager.sync_webshare_proxies() when due; report changes/failures. Never raises."""
+    if not proxy_manager:
+        return
+    try:
+        if not proxy_manager.webshare_sync_due():
+            return
+        res = proxy_manager.sync_webshare_proxies()
+        if res["ok"]:
+            logger.info(f"Webshare proxy sync: {res['count']} proxies (+{len(res['added'])} / -{len(res['removed'])})")
+            if res["first_sync"]:
+                send_telegram_message(
+                    "🔄 *Proxies Webshare synchronisés*\n\n"
+                    f"Première synchronisation depuis l'API : {res['count']} proxies. "
+                    "La liste sera mise à jour toutes les 12h."
+                )
+            elif res["added"] or res["removed"]:
+                send_telegram_message(
+                    "🔄 *Proxies Webshare mis à jour*\n\n"
+                    f"• *Retirés par Webshare :* {', '.join(f'`{k}`' for k in res['removed']) or 'aucun'}\n"
+                    f"• *Ajoutés :* {', '.join(f'`{k}`' for k in res['added']) or 'aucun'}\n"
+                    f"• *Total :* {res['count']} proxies"
+                )
+        elif res["consecutive_failures"] == 3:
+            send_telegram_message(
+                "⚠️ *Synchronisation des proxies Webshare en échec (3 fois de suite)*\n\n"
+                f"Dernière erreur : `{str(res['error']).replace('`', '')[:200]}`\n"
+                "La dernière liste connue reste utilisée ; nouvel essai toutes les heures."
+            )
+    except Exception as err:
+        logger.warning(f"Webshare proxy sync wrapper failed (ignored, polling continues): {err}")
+
+
 def check_and_notify() -> tuple[int, int]:
     """
     Core check cycle:
@@ -2210,7 +2271,10 @@ def main_loop():
                     f"Offres actives en France : {METRICS['last_active_listings_count']}."
                 )
 
-            # 3. Run search check (rotate to next proxy on every cycle)
+            # 3. Refresh the Webshare proxy list if due (every 12 h, or soon after a 407)
+            _maybe_sync_webshare_proxies()
+
+            # 4. Run search check (rotate to next proxy on every cycle)
             if proxy_manager:
                 proxy_manager.rotate_proxy(skip_exhausted=True)
             check_and_notify()
