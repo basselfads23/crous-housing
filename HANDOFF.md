@@ -36,26 +36,43 @@ the 🎯 Snipe button (shown on EVERY alert while auto-apply is off, and LIVE), 
   _detect_and_record_nationwide_new(). Separate from, and in addition to, record_marseille_listing()
   (Marseille-only, curated subset, unchanged). Not gitignored, not currently git-tracked either —
   a decision on whether to commit this (and marseille_listings_data.jsonl) is still open.
-- **Alerts fire once per APPEARANCE (since 2026-10-02), not once per listing ID ever.**
-  Before, `seen_ids` never forgot an ID, so a listing that went offline and was re-posted was
-  silently ignored forever — no alert, no Marseille data line. Measured: since 2026-09-27 Marseille
-  listings were visible ~38 separate times but only 4 alerted; #1165 (Luminy, 350€) re-posted
-  2026-10-02 10:44 got nothing, and the viewer saw ~6 listings online while the owner got 2 alerts.
-  Now `update_listing_visibility()` keeps `active` (online now) + `history` (appearance counts)
-  in listings_seen.json: alert when a listing comes online, never again while it stays online,
-  and again after it goes offline and comes back. The Telegram alert is IDENTICAL either way
-  (user's call 2026-10-02: a re-posted room is just as bookable, and a "seen before" label reads
-  as "skip this one") — whether it's a re-appearance lives only in the data file and the log. "Offline" = missing from `LISTING_GONE_AFTER_MISSES` (2) COMPLETE
-  checks in a row; a check where any tool fetch failed never counts as missing. Why 2, not 1:
-  the API has returned incomplete results with no error (France 53 -> 8 for one check,
-  2026-09-30 00:00 UTC; Marseille 3 -> 2 -> 3 twice on 2026-10-02) — with 1, each such glitch
-  would re-alert everything it hid. marseille_listings_data.jsonl now gets an `"event": "appeared"`
-  line per appearance (`appearance_no`, `reappearance`) and an `"event": "gone"` line when one goes
-  offline (`online_seconds`, `checks_seen`) — lines from before 2026-10-02 have no `event` field.
-  posting_activity.json's Marseille count now counts appearances. The auto-sniper (if re-enabled)
-  also fires on re-appearances — intended, since each is a real new chance. NOT changed: the
-  nationwide raw data (nationwide_seen_ids.json) still records each ID only the first time.
-  Tested by `verify_listing_reappearance_alerts.py`.
+- **A CROUS listing ID is an OFFER = a room TYPE, not one room** (taught by the user from real
+  life 2026-10-04, confirmed in data). Cité Gaston Berger "CHAMBRE SIMPLE" #2156 — the room the
+  bot got the user, who lives there now — covers a whole corridor of identical 12 m² rooms on
+  several floors; CROUS assigns one when you book. 99 of 240 recorded listings even give their
+  surface as a RANGE ("T1 16 à 20m2" = 14.6–22.8 m²), 34 give rent as a range, and the API has no
+  field saying how many rooms an offer covers (lowStock was false on all 240). Consequences:
+  an ID coming back online is NEW AVAILABILITY — usually a different room — never "the same
+  listing repeated/re-posted" (proof: #2156 became available 2026-10-03 17:43 Paris while the
+  user was living in their #2156 room); one availability window may be one room or several freed
+  at once, so counts are availability windows, not rooms; `online_seconds` = how long until every
+  available room of that type was taken.
+- **Alerts fire each time an offer BECOMES AVAILABLE (since 2026-10-02), not once per ID ever.**
+  Before, `seen_ids` never forgot an ID, so once an offer had been alerted, every later
+  availability of that room type was silently ignored forever — no alert, no Marseille data line.
+  Measured: since 2026-09-27 Marseille listings were visible ~38 separate times but only 4
+  alerted; #1165 (Luminy, 350€) available again 2026-10-02 10:44 got nothing, and the viewer saw
+  ~6 listings online while the owner got 2 alerts. Now `update_listing_visibility()` keeps
+  `active` (online now) + `history` (per offer: `availabilities` count, `last_gone_at`) in
+  listings_seen.json: alert when an offer comes online, never again while it stays online, and
+  again after it goes offline and comes back. The Telegram alert is IDENTICAL either way (user's
+  call 2026-10-02: it's just as bookable, and a "seen before" label reads as "skip this one") —
+  whether the offer was available before lives only in the data file and the log ("OFFER
+  AVAILABLE: … (offer #ID, availability #N)"). "Offline" = missing from
+  `LISTING_GONE_AFTER_MISSES` (2) COMPLETE checks in a row; a check where any tool fetch failed
+  never counts as missing. Why 2, not 1: the API has returned incomplete results with no error
+  (France 53 -> 8 for one check, 2026-09-30 00:00 UTC; Marseille 3 -> 2 -> 3 twice on
+  2026-10-02) — with 1, each such glitch would re-alert everything it hid.
+  marseille_listings_data.jsonl gets an `"event": "appeared"` line each time an offer becomes
+  available (`offer_seen_before`, `offer_availability_no` — the latter null when the offer was
+  first seen before tracking started, and a lower bound for those offers afterwards) and an
+  `"event": "gone"` line when it goes offline (`online_seconds`, `checks_seen`); lines from before
+  2026-10-02 have no `event` field. (These two fields were briefly named `reappearance` /
+  `appearance_no`, renamed 2026-10-04 in the 3 lines that had them.) posting_activity.json's
+  Marseille count counts availabilities. The auto-sniper (if re-enabled) also fires on every
+  availability — intended, each is a real chance at a room. NOT changed: the nationwide raw data
+  (nationwide_seen_ids.json) still records each offer ID only the first time.
+  Tested by `verify_offer_availability_alerts.py`.
 - **Fixed 2026-10-02: main_loop() wrote a stale startup snapshot of the state on every failed
   cycle**, erasing every ID recorded since startup (confirmed: #2156 alerted 09-25 07:11, erased
   by failure writes at 12:19-12:58, alerted again 09-27), and making "5 consecutive failures"
@@ -316,7 +333,7 @@ first real trigger, whenever it happens, is the true first live test.
 10. **Test hygiene:** importing crous_watcher attaches a FileHandler to the LIVE watcher.log
    (logging.basicConfig at import). Tests that don't first add a NullHandler to the root logger
    (as verify_proxy_quarantine.py, verify_status_capabilities.py and
-   verify_listing_reappearance_alerts.py do) write fake lines — mocked alerts, MANUAL SNIPE
+   verify_offer_availability_alerts.py do) write fake lines — mocked alerts, MANUAL SNIPE
    triggers — into the production log. 60 such lines from 2026-10-02 test runs were removed;
    older runs may have left more. Use the journal (`journalctl -u crous-watcher`) as the source
    of truth for analysis, or run other tests via a wrapper that adds the NullHandler first.

@@ -1,17 +1,19 @@
 """
-verify_listing_reappearance_alerts.py — run with: venv/bin/python3 verify_listing_reappearance_alerts.py
+verify_offer_availability_alerts.py — run with: venv/bin/python3 verify_offer_availability_alerts.py
 
-Verifies "one alert per appearance" (update_listing_visibility() + check_and_notify()):
+Verifies "one alert each time an offer becomes available" (update_listing_visibility() +
+check_and_notify()). An offer = a CROUS listing ID = a room TYPE covering several identical
+rooms, so an offer coming back online is new availability, usually a different room:
 - a listing alerts when it comes online, and NOT again while it stays online
 - a listing that goes offline (missing from 2 complete checks in a row) and comes back
-  alerts again, with the SAME alert text as a brand-new listing (no "seen before" label);
-  the re-appearance and its appearance number are recorded in the data file only
+  alerts again, with the SAME alert text as a brand-new offer (no "seen before" label);
+  offer_seen_before / offer_availability_no are recorded in the data file only
 - a one-check disappearance (the API returned incomplete results without error:
   53 -> 8 listings on 2026-09-30 00:00 UTC) does NOT cause a second alert
 - a check where part of the fetch failed never counts as "missing"
 - an ID seen before this feature existed (legacy seen_ids) alerts like any other
 - duplicate items in one API response alert once
-- each appearance and each disappearance is recorded in the Marseille data file
+- each availability and each disappearance is recorded in the Marseille data file
 - regression for the stale-state bug: a failed cycle no longer erases IDs recorded
   since startup (_record_cycle_failure() re-reads the file), and main_loop() no
   longer saves a startup snapshot
@@ -94,7 +96,7 @@ class TestVisibilityTracker(unittest.TestCase):
         self.assertEqual((active["A"]["since"], active["A"]["last_seen"], active["A"]["checks"]), ("t0", "t2", 3))
 
 
-class TestCheckAndNotifyReappearance(unittest.TestCase):
+class TestCheckAndNotifyAvailability(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.sent = []
@@ -171,26 +173,27 @@ class TestCheckAndNotifyReappearance(unittest.TestCase):
         # 5. comes back -> alerted again, exactly like a new listing
         out = self.check(A)
         self.assertEqual(len(out), 2)
-        print("\n----- re-appearance alert as sent -----\n" + out[0] + "\n---------------------------------------")
-        self.assertEqual(out[0], first_alert, "re-appearance alert must be identical to the first one")
+        print("\n----- alert when the offer is available again -----\n" + out[0] + "\n---------------------------------------")
+        self.assertEqual(out[0], first_alert, "alert must be identical to the first availability's")
         self.assertNotIn("Déjà vue", out[0])
         self.assertEqual(out[0], out[1], "viewer gets the same text")
         # 6. and again not repeated while it stays up
         self.assertEqual(self.check(A), [])
 
         appeared = [l for l in self.data_lines() if l.get("event") == "appeared"]
-        self.assertEqual([(l["id"], l["appearance_no"], l["reappearance"]) for l in appeared],
+        self.assertEqual([(l["id"], l["offer_availability_no"], l["offer_seen_before"]) for l in appeared],
                          [("1165", 1, False), ("1165", 2, True)])
-        self.assertEqual(cw._count_marseille_appearances(), 2, "/status counts appearances, not gone lines")
+        self.assertNotIn("reappearance", appeared[1], "old repeated-listing field names must be gone")
+        self.assertEqual(cw._count_marseille_availabilities(), 2, "/status counts availabilities, not gone lines")
         state = json.loads((self.tmp / "listings_seen.json").read_text())
-        self.assertEqual(state["history"]["1165"]["appearances"], 2)
+        self.assertEqual(state["history"]["1165"]["availabilities"], 2)
         self.assertIn("1165", state["active"])
 
     def test_partial_fetch_never_marks_listing_gone(self):
         self.check(A)
         for _ in range(4):
             self.assertEqual(self.check(failing_tool=True), [])
-        self.assertEqual(self.check(A), [], "absent only in checks where a tool failed -> still the same appearance")
+        self.assertEqual(self.check(A), [], "absent only in checks where a tool failed -> still the same availability")
         self.assertEqual([l for l in self.data_lines() if l.get("event") == "gone"], [])
 
     def test_legacy_seen_id_alerts_like_any_other(self):
@@ -201,14 +204,14 @@ class TestCheckAndNotifyReappearance(unittest.TestCase):
         self.assertIn("NOUVELLE OFFRE", out[0])
         self.assertNotIn("Déjà vue", out[0])
         last = self.data_lines()[-1]
-        self.assertEqual((last["reappearance"], last["appearance_no"]), (True, None),
+        self.assertEqual((last["offer_seen_before"], last["offer_availability_no"]), (True, None),
                          "data says: seen before, earlier count unknown")
-        # next re-appearance has a known (lower-bound) count -- in the data, not the alert
+        # next availability has a known (lower-bound) count -- in the data, not the alert
         self.check(); self.check()
         out = self.check(B)
         self.assertNotIn("Déjà vue", out[0])
         last = self.data_lines()[-1]
-        self.assertEqual((last["reappearance"], last["appearance_no"]), (True, 3))
+        self.assertEqual((last["offer_seen_before"], last["offer_availability_no"]), (True, 3))
 
     def test_two_listings_independent(self):
         out = self.check(A, B)
@@ -241,14 +244,14 @@ class TestStaleStateRegression(unittest.TestCase):
         st = cw.load_state()
         st["seen_ids"].append("2156")
         st["active"]["2156"] = {"since": "x", "last_seen": "x", "checks": 1, "missed": 0}
-        st["history"]["2156"] = {"appearances": 1}
+        st["history"]["2156"] = {"availabilities": 1}
         cw.save_state(st)
         self.assertEqual(cw._record_cycle_failure(), 1)
         self.assertEqual(cw._record_cycle_failure(), 2)
         after = cw.load_state()
         self.assertIn("2156", after["seen_ids"])
         self.assertIn("2156", after["active"])
-        self.assertEqual(after["history"]["2156"], {"appearances": 1})
+        self.assertEqual(after["history"]["2156"], {"availabilities": 1})
         self.assertEqual(after["consecutive_failures"], 2)
 
     def test_load_state_keeps_unknown_keys_and_old_formats(self):

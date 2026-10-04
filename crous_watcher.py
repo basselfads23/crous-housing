@@ -172,8 +172,8 @@ def _count_lines(path: Path) -> int:
         return 0
 
 
-def _count_marseille_appearances() -> int:
-    """Appearance lines in the Marseille data file (it also holds "gone" lines)."""
+def _count_marseille_availabilities() -> int:
+    """Availability lines ("appeared") in the Marseille data file (it also holds "gone" lines)."""
     try:
         with open(LISTINGS_DATA_FILE, "r", encoding="utf-8") as f:
             return sum(1 for line in f if line.strip() and json.loads(line).get("event", "appeared") == "appeared")
@@ -189,7 +189,7 @@ def _format_bot_capabilities_text(paused: bool, keeper_state: str, has_credentia
     """
     viewers = len(get_viewer_chat_ids())
     nationwide_n = _count_lines(NATIONWIDE_LISTINGS_DATA_FILE)
-    marseille_n = _count_marseille_appearances()
+    marseille_n = _count_marseille_availabilities()
 
     does = []
     does_not = []
@@ -199,9 +199,9 @@ def _format_bot_capabilities_text(paused: bool, keeper_state: str, has_credentia
     else:
         does.append("✅ Recherche des offres CROUS (toute la France) via l'API publique — *sans connexion à ton compte*")
         does.append(
-            f"✅ Alerte Telegram à chaque mise en ligne d'une offre à {TARGET_CITY.capitalize()} ≤ {MAX_PRICE:.0f} € "
-            f"(toi + {viewers} viewer{'s' if viewers != 1 else ''}) — y compris une offre déjà vue qui revient, "
-            f"une seule alerte tant qu'elle reste en ligne"
+            f"✅ Alerte Telegram chaque fois qu'un type de chambre à {TARGET_CITY.capitalize()} ≤ {MAX_PRICE:.0f} € "
+            f"devient disponible (toi + {viewers} viewer{'s' if viewers != 1 else ''}), même s'il l'a déjà été avant "
+            f"— une seule alerte tant qu'il reste en ligne"
         )
         does.append(
             f"✅ Collecte de données : {nationwide_n} offres France + {marseille_n} mises en ligne "
@@ -858,7 +858,7 @@ def load_state() -> dict:
       seen_ids             -- every Marseille listing ID ever alerted (history only)
       consecutive_failures -- failed cycles in a row (reset by each successful cycle)
       active               -- listings currently considered online; see update_listing_visibility()
-      history              -- per-ID appearance count and when it last went offline
+      history              -- per offer ID: how many times it became available, when it last went offline
     """
     state = {}
     if STATE_FILE.exists():
@@ -908,23 +908,31 @@ def _record_cycle_failure() -> int:
     return state["consecutive_failures"]
 
 
-# A listing counts as gone (so its next appearance alerts again) only after it is
+# A listing counts as gone (so it alerts again when it next becomes available) only after it is
 # missing from this many COMPLETE checks in a row. One is not enough: the search API
 # has returned incomplete results without any error -- 53 -> 8 listings for one check
 # on 2026-09-30 00:00 UTC, and single-check Marseille dips (3 -> 2 -> 3) on 2026-10-02
 # -- and with a threshold of 1, each of those would have re-alerted every listing it
-# hid. Cost: a listing taken and re-posted within ~2 checks (~1-1.5 min at peak
-# cadence, ~8 min at night) doesn't get a second alert.
+# hid. Cost: if every room of a type is taken and another frees up within ~2 checks
+# (~1-1.5 min at peak cadence, ~8 min at night), that doesn't get a second alert.
 LISTING_GONE_AFTER_MISSES = 2
 
 
 def update_listing_visibility(active: dict, present: dict, fetch_complete: bool, now_iso: str,
                               gone_after_misses: int = LISTING_GONE_AFTER_MISSES) -> tuple[list, list]:
     """
-    Track which matching listings are currently online, so an alert fires once per
-    APPEARANCE: when a listing comes online, never again while it stays online, and
-    again if it goes offline and later comes back (a re-posting -- previously these
-    were silently ignored forever, because seen_ids never forgets an ID).
+    Track which matching listings are currently online, so an alert fires once each time
+    an offer BECOMES AVAILABLE: when it comes online, never again while it stays online,
+    and again if it goes offline and later comes back (previously that was silently
+    ignored forever, because seen_ids never forgets an ID).
+
+    A CROUS listing ID is an OFFER -- a room TYPE at a residence covering several
+    identical rooms (e.g. Cité Gaston Berger "CHAMBRE SIMPLE" #2156 is a whole corridor's
+    worth of 12 m² rooms; 41% of listings even give their surface as a range, e.g.
+    "T1 16 à 20m2" = 14.6-22.8 m²). The API has no count of how many rooms an offer
+    covers. So an ID coming back online is NEW availability -- usually a different
+    room -- never "the same listing repeated", and one availability window may be one
+    room or several freed at once.
 
     active:  {id: {"since", "last_seen", "checks", "missed", ...snapshot}} -- mutated in place
     present: {id: snapshot dict} for the matching listings seen in THIS check
@@ -977,24 +985,26 @@ def append_run_history(status: str, summary: str) -> None:
 
 
 def record_marseille_listing(info: dict, tool_id: str, listing_url: str,
-                             appearance_no: int | None = 1, reappearance: bool = False) -> None:
+                             offer_availability_no: int | None = 1, offer_seen_before: bool = False) -> None:
     """
-    Append one line of raw structured data for every Marseille listing APPEARANCE
-    (first time online, or back online after going offline -- see
-    update_listing_visibility()), regardless of price or whether it qualified for
-    auto-apply. This is deliberately
+    Append one line of raw structured data each time a Marseille offer BECOMES
+    AVAILABLE (first time online, or online again after going offline -- see
+    update_listing_visibility(); an offer is a room type, not one room), regardless
+    of price or whether it qualified for auto-apply. This is deliberately
     unfiltered observational data (price, surface, room type, mode, coordinates,
     timestamp) so the sniper's price/surface tier thresholds can eventually be tuned
     against real market data instead of guessed at. Append-only JSONL (one JSON
     object per line); never overwrites or trims previous entries. Lines written
-    before 2026-10-02 have no "event" field and are all first appearances.
-    appearance_no is None when the earlier count is unknown (ID seen before the
-    appearance tracking existed).
+    before 2026-10-02 have no "event" field and were each an offer's first availability.
+    offer_seen_before: this offer (room type) has been available before -- usually means
+        a different room of the same type, NOT the same room repeated.
+    offer_availability_no: the Nth time this offer became available since tracking began;
+        None when unknown (offer first seen before 2026-10-02, when tracking started).
     """
     entry = {
         "event": "appeared",
-        "appearance_no": appearance_no,
-        "reappearance": reappearance,
+        "offer_availability_no": offer_availability_no,
+        "offer_seen_before": offer_seen_before,
         "seen_at": datetime.now(timezone.utc).isoformat(),
         "id": info.get("id"),
         "tool_id": tool_id,
@@ -1711,9 +1721,9 @@ def check_and_notify() -> tuple[int, int]:
     """
     Core check cycle:
     1. Fetches listings from active CROUS tool(s).
-    2. Identifies matching Marseille listings that just came online -- first time ever,
-       or back after going offline (update_listing_visibility()). One alert per
-       appearance: never repeated while a listing stays online.
+    2. Identifies matching Marseille offers (room types) that just became available --
+       first time ever, or again after going offline (update_listing_visibility()). One
+       alert each time: never repeated while an offer stays online.
     3. Triggers immediate auto-apply if the listing qualifies (is_target_listing()).
     4. Sends Telegram alert (with sniper screenshot if applied, or manual link otherwise).
     5. Updates listings_seen.json (seen_ids, active, history).
@@ -1821,30 +1831,31 @@ def check_and_notify() -> tuple[int, int]:
             tool_id = item.get("_tool_id", "47")
 
             if item_id in to_alert:
-                # LISTING JUST CAME ONLINE -- first time ever, or back after going offline.
-                to_alert.discard(item_id)  # once per appearance, even if the API repeats an item
+                # OFFER JUST BECAME AVAILABLE -- first time ever, or again after going offline.
+                to_alert.discard(item_id)  # once per availability, even if the API repeats an item
                 hist = history.setdefault(item_id, {})
-                count_known = "appearances" in hist
-                reappearance = count_known or item_id in seen_ids
-                hist["appearances"] = hist.get("appearances", 1 if item_id in seen_ids else 0) + 1
-                appearance_no = hist["appearances"] if (count_known or not reappearance) else None
+                count_known = "availabilities" in hist
+                offer_seen_before = count_known or item_id in seen_ids
+                hist["availabilities"] = hist.get("availabilities", 1 if item_id in seen_ids else 0) + 1
+                availability_no = hist["availabilities"] if (count_known or not offer_seen_before) else None
 
                 mode_name = "Colocation" if info["is_coloc"] else "Individuel"
                 is_sniper_target = info["should_auto_apply"] and bool(apply_for_accommodation)
                 logger.info(
-                    f"✨ {'LISTING BACK ONLINE' if reappearance else 'NEW LISTING'}: {info['residence_name']} "
-                    f"({info['price']}€) | appearance #{appearance_no or '?'} | Sniper Target: {is_sniper_target}"
+                    f"✨ OFFER AVAILABLE: {info['residence_name']} {info['label']} ({info['price']}€) "
+                    f"(offer #{item_id}, availability #{availability_no or '?'}) | Sniper Target: {is_sniper_target}"
                 )
                 listing_url = f"https://trouverunlogement.lescrous.fr/tools/{tool_id}/accommodations/{item_id}"
                 record_marseille_listing(info, tool_id, listing_url,
-                                         appearance_no=appearance_no, reappearance=reappearance)
+                                         offer_availability_no=availability_no,
+                                         offer_seen_before=offer_seen_before)
                 coloc_tag = " [Colocation]" if info["is_coloc"] else ""
 
                 # 1. SEND DIRECT LINK IMMEDIATELY so the user can apply manually without delay
                 logger.info(f"⚡ [IMMEDIATE ALERT] Sending listing #{item_id} link to Telegram first...")
-                # Same alert whether or not it was seen before: a re-posted room is just as
-                # bookable, and a "seen before" label reads as "skip this one". Whether it is a
-                # re-appearance is recorded in the data file and the log line above instead.
+                # Same alert whether or not this offer was available before: it's usually a
+                # different room of the same type, just as bookable, and a "seen before" label
+                # reads as "skip this one". That's recorded in the data file and the log instead.
                 alert_text = (
                     "🚨 *NOUVELLE OFFRE CROUS TROUVÉE !*\n\n"
                     f"📍 *Résidence :* {info['residence_name']}\n"
