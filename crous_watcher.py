@@ -36,6 +36,7 @@ LOG_FILE = BASE_DIR / "watcher.log"
 LISTINGS_DATA_FILE = BASE_DIR / "marseille_listings_data.jsonl"
 NATIONWIDE_LISTINGS_DATA_FILE = BASE_DIR / "nationwide_listings_data.jsonl"
 NATIONWIDE_SEEN_FILE = BASE_DIR / "nationwide_seen_ids.json"
+NATIONWIDE_STATE_FILE = BASE_DIR / "nationwide_state.json"
 POSTING_ACTIVITY_FILE = BASE_DIR / "posting_activity.json"
 TELEGRAM_OFFSET_FILE = BASE_DIR / ".telegram_update_offset"
 
@@ -164,18 +165,11 @@ def _session_keeper_state() -> str:
         return "unknown"
 
 
-def _count_lines(path: Path) -> int:
+def _count_availabilities(path: Path) -> int:
+    """Availability lines in a data file: "appeared" events, plus pre-2026-10 lines without
+    an "event" field (each a first availability). Excludes "gone" lines."""
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return sum(1 for _ in f)
-    except Exception:
-        return 0
-
-
-def _count_marseille_availabilities() -> int:
-    """Availability lines ("appeared") in the Marseille data file (it also holds "gone" lines)."""
-    try:
-        with open(LISTINGS_DATA_FILE, "r", encoding="utf-8") as f:
             return sum(1 for line in f if line.strip() and json.loads(line).get("event", "appeared") == "appeared")
     except Exception:
         return 0
@@ -188,8 +182,8 @@ def _format_bot_capabilities_text(paused: bool, keeper_state: str, has_credentia
     from module config) so it can be tested without systemd or Telegram.
     """
     viewers = len(get_viewer_chat_ids())
-    nationwide_n = _count_lines(NATIONWIDE_LISTINGS_DATA_FILE)
-    marseille_n = _count_marseille_availabilities()
+    nationwide_n = _count_availabilities(NATIONWIDE_LISTINGS_DATA_FILE)
+    marseille_n = _count_availabilities(LISTINGS_DATA_FILE)
 
     does = []
     does_not = []
@@ -204,7 +198,7 @@ def _format_bot_capabilities_text(paused: bool, keeper_state: str, has_credentia
             f"— une seule alerte tant qu'il reste en ligne"
         )
         does.append(
-            f"✅ Collecte de données : {nationwide_n} offres France + {marseille_n} mises en ligne "
+            f"✅ Collecte de données : {nationwide_n} mises en ligne France + {marseille_n} mises en ligne "
             f"{TARGET_CITY.capitalize()} enregistrées (avec leur durée en ligne), + heures de publication suivies"
         )
 
@@ -963,6 +957,19 @@ def update_listing_visibility(active: dict, present: dict, fetch_complete: bool,
     return appeared, gone
 
 
+def _count_availability(history: dict, seen: set, offer_id: str) -> tuple[bool, int | None]:
+    """
+    Bump an offer's availability count in history; return (offer_seen_before,
+    offer_availability_no). The number is None when the offer was seen before tracking
+    started (its earlier count is unknown); afterwards it's a lower bound for such offers.
+    """
+    hist = history.setdefault(offer_id, {})
+    count_known = "availabilities" in hist
+    seen_before = count_known or offer_id in seen
+    hist["availabilities"] = hist.get("availabilities", 1 if offer_id in seen else 0) + 1
+    return seen_before, (hist["availabilities"] if (count_known or not seen_before) else None)
+
+
 def append_run_history(status: str, summary: str) -> None:
     """Append a concise entry to run_history.log (capped at last 500 lines)."""
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1027,11 +1034,16 @@ def record_marseille_listing(info: dict, tool_id: str, listing_url: str,
         logger.error(f"Failed to record listing data: {err}")
 
 
-def record_marseille_listing_gone(listing_id: str, entry: dict, detected_at_iso: str) -> None:
+_TRACKING_KEYS = ("since", "last_seen", "checks", "missed", "seeded")
+
+
+def _record_gone_event(path: Path, listing_id: str, entry: dict, detected_at_iso: str) -> None:
     """
-    Append a "gone" line to the same file when a listing goes offline, closing the
-    matching "appeared" line. online_seconds = last check that saw it minus the first,
-    so 0 means it was online for a single check only (i.e. less than one check interval).
+    Append a "gone" line to a data file when an offer goes offline, closing its matching
+    "appeared" line. online_seconds = last check that saw it minus the first, so 0 means
+    it was online for a single check only (i.e. less than one check interval). Offers
+    already online when tracking started have no known start: appeared_at and
+    online_seconds are null and online_since_before_tracking is true.
     """
     since, last_seen = entry.get("since"), entry.get("last_seen")
     try:
@@ -1046,23 +1058,26 @@ def record_marseille_listing_gone(listing_id: str, entry: dict, detected_at_iso:
         "gone_detected_at": detected_at_iso,
         "online_seconds": online_seconds,
         "checks_seen": entry.get("checks"),
-        "residence_name": entry.get("residence_name"),
-        "label": entry.get("label"),
-        "price": entry.get("price"),
     }
+    if entry.get("seeded"):
+        line["online_since_before_tracking"] = True
+    line.update({k: v for k, v in entry.items() if k not in _TRACKING_KEYS})
     try:
-        with open(LISTINGS_DATA_FILE, "a", encoding="utf-8") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
     except Exception as err:
-        logger.error(f"Failed to record listing gone event: {err}")
+        logger.error(f"Failed to record gone event to {path.name}: {err}")
 
 
-def record_nationwide_listing_raw(item: dict, tool_id: str) -> None:
+def record_nationwide_listing_raw(item: dict, tool_id: str, offer_seen_before: bool = False,
+                                  offer_availability_no: int | None = 1) -> None:
     """
-    Append the FULL raw listing record, exactly as CROUS's search API returned it, for
-    ONE newly-seen listing -- any city, not just Marseille, and regardless of whether it
-    matches any auto-apply rule. Append-only JSONL (one JSON object per line), never
-    overwrites or trims previous entries.
+    Append the FULL raw listing record, exactly as CROUS's search API returned it, each
+    time an offer BECOMES AVAILABLE -- any city, not just Marseille, and regardless of
+    whether it matches any auto-apply rule. Append-only JSONL (one JSON object per line),
+    never overwrites or trims previous entries. Until 2026-10-04 only an offer's FIRST
+    availability was recorded (lines without an "event" field); see
+    _track_nationwide_availability() for why that changed.
 
     Deliberately broader than record_marseille_listing() above, which keeps only a
     curated subset of fields for Marseille matches: this keeps every field CROUS sent,
@@ -1076,6 +1091,9 @@ def record_nationwide_listing_raw(item: dict, tool_id: str) -> None:
     posted at night / on weekends (see HANDOFF "Night/day request throttling").
     """
     entry = {
+        "event": "appeared",
+        "offer_availability_no": offer_availability_no,
+        "offer_seen_before": offer_seen_before,
         "seen_at": datetime.now(timezone.utc).isoformat(),
         "tool_id": tool_id,
         "item": {k: v for k, v in item.items() if k != "_tool_id"},
@@ -1087,21 +1105,94 @@ def record_nationwide_listing_raw(item: dict, tool_id: str) -> None:
         logger.error(f"Failed to record nationwide listing data: {err}")
 
 
-def _detect_and_record_nationwide_new(all_raw_items: list, nationwide_seen: set) -> set:
+def _nationwide_snapshot(item: dict) -> dict:
+    """Small per-offer summary kept while it's online, written into its "gone" line."""
+    residence = item.get("residence") or {}
+    rents = [m.get("rent", {}).get("min") for m in item.get("occupationModes") or []]
+    rents = [r for r in rents if isinstance(r, (int, float))]
+    return {
+        "residence_name": residence.get("label"),
+        "label": item.get("label"),
+        "address": residence.get("address"),
+        "min_rent": round(min(rents) / 100, 2) if rents else None,
+    }
+
+
+def _track_nationwide_availability(all_raw_items: list, nationwide_seen: set, nat_state: dict,
+                                   fetch_complete: bool, now_iso: str) -> int:
     """
-    Given this cycle's full raw item list and the previously-seen nationwide ID set,
-    returns the set of genuinely new IDs (any city) and, as a side effect, records the
-    full raw item for each one via record_nationwide_listing_raw(). Extracted out of
-    check_and_notify() so this can be unit-tested directly, without mocking the
-    network/Telegram machinery around it.
+    Nationwide (any city) version of the Marseille availability tracking: record the full
+    raw item each time any offer in France BECOMES AVAILABLE, and a "gone" line when it
+    goes offline -- same update_listing_visibility() rules (2 complete checks missing =
+    gone). Returns how many offers became available in this check.
+
+    Why (2026-10-04): the previous version recorded an offer only the FIRST time its ID
+    was ever seen. Since an ID is a room type that keeps coming back, that missed >=70% of
+    real availability and was saturating (326 known IDs; Saturday 2026-10-03 had >=56
+    availability events in France and 0 never-seen IDs).
+
+    Mutates nationwide_seen (every ID seen is added) and nat_state
+    ({"active", "history", "tracking_started"}). On the first COMPLETE check, offers that
+    are already online and already known are absorbed silently (seeded) instead of being
+    logged as "just became available" with a wrong time; their gone lines are flagged
+    online_since_before_tracking. An unknown ID at that moment is a normal availability.
     """
-    new_ids = set()
+    active = nat_state.setdefault("active", {})
+    history = nat_state.setdefault("history", {})
+    items_by_id = {}
     for it in all_raw_items:
         iid = str(it.get("id", ""))
-        if iid and iid not in nationwide_seen and iid not in new_ids:
-            new_ids.add(iid)
-            record_nationwide_listing_raw(it, it.get("_tool_id", "47"))
-    return new_ids
+        if iid and iid not in items_by_id:
+            items_by_id[iid] = it
+
+    if not nat_state.get("tracking_started"):
+        if not fetch_complete:
+            return 0  # a seed from a partial fetch would later log missing offers as new
+        nat_state["tracking_started"] = now_iso
+        for iid, it in items_by_id.items():
+            if iid in nationwide_seen:
+                # checks=0: the update_listing_visibility() call just below counts this check
+                active[iid] = dict(_nationwide_snapshot(it), since=None, last_seen=now_iso,
+                                   checks=0, missed=0, seeded=True)
+
+    present = {iid: _nationwide_snapshot(it) for iid, it in items_by_id.items()}
+    appeared, gone = update_listing_visibility(active, present, fetch_complete, now_iso)
+    for gone_id, gone_entry in gone:
+        history.setdefault(gone_id, {})["last_gone_at"] = gone_entry.get("last_seen")
+        _record_gone_event(NATIONWIDE_LISTINGS_DATA_FILE, gone_id, gone_entry, now_iso)
+    for iid in appeared:
+        seen_before, availability_no = _count_availability(history, nationwide_seen, iid)
+        it = items_by_id[iid]
+        record_nationwide_listing_raw(it, it.get("_tool_id", "47"),
+                                      offer_seen_before=seen_before, offer_availability_no=availability_no)
+    nationwide_seen.update(items_by_id)
+    if appeared or gone:
+        logger.info(f"🌍 France: {len(appeared)} offer(s) became available, {len(gone)} went offline")
+    return len(appeared)
+
+
+def load_nationwide_state() -> dict:
+    """Nationwide availability tracking state (see _track_nationwide_availability())."""
+    try:
+        data = json.loads(NATIONWIDE_STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except FileNotFoundError:
+        pass
+    except Exception as err:
+        logger.warning(f"Error reading {NATIONWIDE_STATE_FILE}: {err}. Resetting.")
+    return {"active": {}, "history": {}, "tracking_started": None}
+
+
+def save_nationwide_state(nat_state: dict) -> None:
+    """Save atomically using a temporary file, same pattern as save_state()."""
+    temp_file = NATIONWIDE_STATE_FILE.with_suffix(".tmp")
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(nat_state, f, ensure_ascii=False)
+        temp_file.replace(NATIONWIDE_STATE_FILE)
+    except Exception as err:
+        logger.error(f"Failed to save {NATIONWIDE_STATE_FILE}: {err}")
 
 
 def load_nationwide_seen_ids() -> set:
@@ -1135,6 +1226,10 @@ def record_posting_activity(nationwide_new_count: int, marseille_new_count: int)
     the untested "quiet at night/on Sundays" assumption the smart-cadence feature
     currently runs on -- eventually used to widen/tune the "peak hours" cadence
     window with evidence instead of a guess.
+
+    Counts are availability events (an offer becoming available, incl. room types seen
+    before): Marseille since 2026-10-02, nationwide since 2026-10-04. Before those dates
+    they counted only never-seen-before IDs.
 
     No-op (no write at all) when nothing new was seen this cycle, since
     check_and_notify() runs frequently and most cycles find nothing new.
@@ -1789,12 +1884,18 @@ def check_and_notify() -> tuple[int, int]:
     METRICS["last_check_time"] = datetime.now(timezone.utc)
     METRICS["total_checks"] += 1
 
-    # Nationwide (any city) new-listing detection, for posting-activity tracking --
-    # separate from the Marseille-only seen_ids/alerting logic below.
+    # Nationwide (any city) availability tracking -- every time any offer in France becomes
+    # available, and when it goes offline. Separate from the Marseille alerting logic below.
+    now_iso = datetime.now(timezone.utc).isoformat()
     nationwide_seen = load_nationwide_seen_ids()
-    nationwide_new_ids = _detect_and_record_nationwide_new(all_raw_items, nationwide_seen)
-    if nationwide_new_ids:
-        save_nationwide_seen_ids(nationwide_seen | nationwide_new_ids)
+    seen_count_before = len(nationwide_seen)
+    nat_state = load_nationwide_state()
+    nationwide_available = _track_nationwide_availability(
+        all_raw_items, nationwide_seen, nat_state, fetch_complete=not errors_encountered, now_iso=now_iso
+    )
+    save_nationwide_state(nat_state)
+    if len(nationwide_seen) != seen_count_before:
+        save_nationwide_seen_ids(nationwide_seen)
 
     matching_listings = []
     new_alerts_sent = 0
@@ -1810,13 +1911,12 @@ def check_and_notify() -> tuple[int, int]:
                 "label": info.get("label"),
                 "price": info.get("price"),
             }
-    now_iso = datetime.now(timezone.utc).isoformat()
     appeared, gone = update_listing_visibility(
         active, present, fetch_complete=not errors_encountered, now_iso=now_iso
     )
     for gone_id, gone_entry in gone:
         history.setdefault(gone_id, {})["last_gone_at"] = gone_entry.get("last_seen")
-        record_marseille_listing_gone(gone_id, gone_entry, now_iso)
+        _record_gone_event(LISTINGS_DATA_FILE, gone_id, gone_entry, now_iso)
         logger.info(
             f"👋 Listing #{gone_id} ({gone_entry.get('residence_name')}) went offline "
             f"(seen in {gone_entry.get('checks')} check(s) since {gone_entry.get('since')})"
@@ -1833,11 +1933,7 @@ def check_and_notify() -> tuple[int, int]:
             if item_id in to_alert:
                 # OFFER JUST BECAME AVAILABLE -- first time ever, or again after going offline.
                 to_alert.discard(item_id)  # once per availability, even if the API repeats an item
-                hist = history.setdefault(item_id, {})
-                count_known = "availabilities" in hist
-                offer_seen_before = count_known or item_id in seen_ids
-                hist["availabilities"] = hist.get("availabilities", 1 if item_id in seen_ids else 0) + 1
-                availability_no = hist["availabilities"] if (count_known or not offer_seen_before) else None
+                offer_seen_before, availability_no = _count_availability(history, seen_ids, item_id)
 
                 mode_name = "Colocation" if info["is_coloc"] else "Individuel"
                 is_sniper_target = info["should_auto_apply"] and bool(apply_for_accommodation)
@@ -1952,7 +2048,7 @@ def check_and_notify() -> tuple[int, int]:
     state["consecutive_failures"] = 0
     save_state(state)
 
-    record_posting_activity(len(nationwide_new_ids), new_alerts_sent)
+    record_posting_activity(nationwide_available, new_alerts_sent)
 
     summary = (
         f"Check completed: {len(all_raw_items)} in France | "

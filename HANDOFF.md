@@ -30,11 +30,20 @@ the 🎯 Snipe button (shown on EVERY alert while auto-apply is off, and LIVE), 
 ## Architecture
 - crous_watcher.py — main polling loop, Telegram bot (commands + the owner-only "Snipe" button),
   fetch_all_crous_listings(), discover_tool_ids() (cached hourly), check_and_notify(), main_loop().
-  Since 2026-09-27, record_nationwide_listing_raw() also appends the FULL raw CROUS record (every
-  field, not a curated subset — equipments, media captions, occupationModes, availability...) to
-  nationwide_listings_data.jsonl for every genuinely new listing anywhere in France, via
-  _detect_and_record_nationwide_new(). Separate from, and in addition to, record_marseille_listing()
-  (Marseille-only, curated subset, unchanged). Not gitignored, not currently git-tracked either —
+  record_nationwide_listing_raw() appends the FULL raw CROUS record (every field, not a curated
+  subset — equipments, media captions, occupationModes, availability...) to
+  nationwide_listings_data.jsonl. Since 2026-10-04 this happens EACH TIME any offer in France
+  becomes available (`"event": "appeared"`, `offer_seen_before`, `offer_availability_no`), plus a
+  `"event": "gone"` line when it goes offline (`online_seconds`, `checks_seen`, residence/label/
+  address/min_rent), via _track_nationwide_availability() — same update_listing_visibility() rules
+  as Marseille, state in nationwide_state.json (gitignored). From 2026-09-27 to 2026-10-04 it only
+  recorded an offer's FIRST-ever sighting (240 lines, no `event` field); that missed >=70% of real
+  availability and was saturating (Sat 2026-10-03: >=56 availability events, 0 never-seen IDs).
+  Offers already online when tracking started (first complete check after the 2026-10-04 deploy)
+  were absorbed silently rather than logged as new; their gone lines carry
+  `online_since_before_tracking: true` and null appeared_at/online_seconds. posting_activity.json's
+  nationwide count = availability events from 2026-10-04 (first-ever IDs before). Separate from, and
+  in addition to, record_marseille_listing() (Marseille-only, curated subset). Not gitignored, not currently git-tracked either —
   a decision on whether to commit this (and marseille_listings_data.jsonl) is still open.
 - **A CROUS listing ID is an OFFER = a room TYPE, not one room** (taught by the user from real
   life 2026-10-04, confirmed in data). Cité Gaston Berger "CHAMBRE SIMPLE" #2156 — the room the
@@ -70,8 +79,8 @@ the 🎯 Snipe button (shown on EVERY alert while auto-apply is off, and LIVE), 
   2026-10-02 have no `event` field. (These two fields were briefly named `reappearance` /
   `appearance_no`, renamed 2026-10-04 in the 3 lines that had them.) posting_activity.json's
   Marseille count counts availabilities. The auto-sniper (if re-enabled) also fires on every
-  availability — intended, each is a real chance at a room. NOT changed: the nationwide raw data
-  (nationwide_seen_ids.json) still records each offer ID only the first time.
+  availability — intended, each is a real chance at a room. Nationwide data uses the same tracking
+  since 2026-10-04 (see the crous_watcher.py bullet above).
   Tested by `verify_offer_availability_alerts.py`.
 - **Fixed 2026-10-02: main_loop() wrote a stale startup snapshot of the state on every failed
   cycle**, erasing every ID recorded since startup (confirmed: #2156 alerted 09-25 07:11, erased

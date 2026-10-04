@@ -12,13 +12,13 @@ Verifies:
    lookup out of the city-match if/else (it used to only be defined in the
    "else" branch, which would have been a NameError once the parsed dict
    started referencing lat/lon unconditionally).
-4. record_nationwide_listing_raw() / _detect_and_record_nationwide_new()
-   (added 2026-09-27): the FULL raw item (not a curated subset) is recorded for
-   every genuinely new ID nationwide, any city; the internal "_tool_id" bookkeeping
-   key is stripped from the recorded item body; an item already in nationwide_seen
-   is not recorded again; a duplicate id appearing twice in the SAME batch is only
-   recorded once; the returned new-ids set matches exactly what the old inline
-   set-comprehension would have produced.
+4. record_nationwide_listing_raw() / _track_nationwide_availability()
+   (added 2026-09-27, availability tracking since 2026-10-04): the FULL raw item (not
+   a curated subset) is recorded each time an offer becomes available nationwide, any
+   city -- including an offer (room type) already seen before, flagged
+   offer_seen_before; the internal "_tool_id" bookkeeping key is stripped from the
+   recorded item body; a duplicate id appearing twice in the SAME batch is only
+   recorded once; every id seen is added to nationwide_seen.
 
 Read-only-ish: writes to a temporary file, not the real
 marseille_listings_data.jsonl / nationwide_listings_data.jsonl. No network access.
@@ -140,13 +140,19 @@ with tempfile.TemporaryDirectory() as tmpdir:
         no_id_item = {"label": "no id field, must be skipped"}
 
         batch = [rich_item, already_seen_item] + duplicate_in_batch + [no_id_item]
-        new_ids = crous_watcher._detect_and_record_nationwide_new(batch, nationwide_seen={"5002"})
+        seen = {"5002"}
+        nat_state = {"active": {}, "history": {}, "tracking_started": "2026-10-04T00:00:00+00:00"}
+        n = crous_watcher._track_nationwide_availability(batch, seen, nat_state, True, "2026-10-04T10:00:00+00:00")
 
-        check("new-ids set matches expectation (5002 already seen, no-id skipped, 5003 counted once)",
-              new_ids == {"5001", "5003"}, str(new_ids))
+        check("3 availabilities (5001 new, 5002 known room type available again, 5003 once; no-id skipped)",
+              n == 3, str(n))
+        check("every id seen is now in nationwide_seen", seen == {"5001", "5002", "5003"}, str(seen))
 
         lines = [json.loads(l) for l in tmp_file.read_text(encoding="utf-8").strip().split("\n")]
-        check("exactly 2 lines recorded (not 3 -- the in-batch duplicate wasn't double-written)", len(lines) == 2, str(len(lines)))
+        check("exactly 3 lines recorded (not 4 -- the in-batch duplicate wasn't double-written)", len(lines) == 3, str(len(lines)))
+        known_row = next(r for r in lines if r["item"]["id"] == "5002")
+        check("known room type recorded again, flagged seen-before with unknown earlier count",
+              (known_row["event"], known_row["offer_seen_before"], known_row["offer_availability_no"]) == ("appeared", True, None))
 
         rich_row = next(r for r in lines if r["item"]["id"] == "5001")
         check("full raw item preserved, including fields record_marseille_listing() would have dropped",
@@ -155,6 +161,8 @@ with tempfile.TemporaryDirectory() as tmpdir:
         check("'_tool_id' bookkeeping key stripped from the recorded item body", "_tool_id" not in rich_row["item"])
         check("tool_id recorded in the envelope instead", rich_row.get("tool_id") == "47")
         check("seen_at timestamp present", isinstance(rich_row.get("seen_at"), str) and len(rich_row["seen_at"]) > 0)
+        check("brand-new offer flagged as first availability",
+              (rich_row["offer_seen_before"], rich_row["offer_availability_no"]) == (False, 1))
 
         dup_rows = [r for r in lines if r["item"]["id"] == "5003"]
         check("the in-batch duplicate id was recorded exactly once", len(dup_rows) == 1, str(len(dup_rows)))

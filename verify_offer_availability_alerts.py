@@ -14,6 +14,10 @@ rooms, so an offer coming back online is new availability, usually a different r
 - an ID seen before this feature existed (legacy seen_ids) alerts like any other
 - duplicate items in one API response alert once
 - each availability and each disappearance is recorded in the Marseille data file
+- NATIONWIDE (since 2026-10-04): same tracking for every offer in France -- full raw
+  item on each availability, a gone line when it goes offline; offers already online
+  when tracking starts are absorbed silently (no fake "just became available" lines),
+  and their gone line says online_since_before_tracking; no seeding from a partial fetch
 - regression for the stale-state bug: a failed cycle no longer erases IDs recorded
   since startup (_record_cycle_failure() re-reads the file), and main_loop() no
   longer saves a startup snapshot
@@ -106,6 +110,7 @@ class TestCheckAndNotifyAvailability(unittest.TestCase):
             "LISTINGS_DATA_FILE": "marseille.jsonl",
             "NATIONWIDE_LISTINGS_DATA_FILE": "nationwide.jsonl",
             "NATIONWIDE_SEEN_FILE": "nationwide_seen.json",
+            "NATIONWIDE_STATE_FILE": "nationwide_state.json",
             "POSTING_ACTIVITY_FILE": "posting.json",
             "HISTORY_LOG_FILE": "history.log",
         }
@@ -184,7 +189,13 @@ class TestCheckAndNotifyAvailability(unittest.TestCase):
         self.assertEqual([(l["id"], l["offer_availability_no"], l["offer_seen_before"]) for l in appeared],
                          [("1165", 1, False), ("1165", 2, True)])
         self.assertNotIn("reappearance", appeared[1], "old repeated-listing field names must be gone")
-        self.assertEqual(cw._count_marseille_availabilities(), 2, "/status counts availabilities, not gone lines")
+        self.assertEqual(cw._count_availabilities(cw.LISTINGS_DATA_FILE), 2, "/status counts availabilities, not gone lines")
+        nat = [json.loads(l) for l in (self.tmp / "nationwide.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([(l["event"], l.get("offer_availability_no")) for l in nat],
+                         [("appeared", 1), ("gone", None), ("appeared", 2)],
+                         "nationwide data tracks the same availabilities through check_and_notify()")
+        posting = json.loads((self.tmp / "posting.json").read_text())
+        self.assertEqual(sum(d.get("nationwide_count", 0) for d in posting.values()), 2)
         state = json.loads((self.tmp / "listings_seen.json").read_text())
         self.assertEqual(state["history"]["1165"]["availabilities"], 2)
         self.assertIn("1165", state["active"])
@@ -226,6 +237,82 @@ class TestCheckAndNotifyAvailability(unittest.TestCase):
         for text in self.check(A, B):
             outside = re.sub(r"`[^`]*`", "", text)
             self.assertEqual(outside.count("*") % 2, 0, text)
+
+
+C = _real_item("1811")  # RESIDENCE CREIL studio -- not Marseille
+
+
+class TestNationwideAvailability(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.p = mock.patch.object(cw, "NATIONWIDE_LISTINGS_DATA_FILE", self.tmp / "nationwide.jsonl")
+        self.p.start()
+        self.seen = {"1165", "2168", "1811"}  # all three known before tracking started
+        self.state = {"active": {}, "history": {}, "tracking_started": None}
+        self.t = 0
+
+    def tearDown(self):
+        self.p.stop()
+        shutil.rmtree(self.tmp)
+
+    def check(self, *items, complete=True):
+        self.t += 1
+        now = f"2026-10-04T10:{self.t:02d}:00+00:00"
+        return cw._track_nationwide_availability([dict(i, _tool_id="47") for i in items],
+                                                 self.seen, self.state, complete, now)
+
+    def lines(self):
+        p = self.tmp / "nationwide.jsonl"
+        return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines()] if p.exists() else []
+
+    def test_lifecycle_with_seeding(self):
+        new_item = dict(C, id=999999)  # a room type never seen before
+        # first complete check: the 3 known offers are absorbed silently, the unknown one is real
+        self.assertEqual(self.check(A, B, C, new_item), 1)
+        self.assertEqual([(l["event"], l["item"]["id"], l["offer_seen_before"]) for l in self.lines()],
+                         [("appeared", 999999, False)])
+        self.assertIsNotNone(self.state["tracking_started"])
+        # stays online, then a one-check glitch -> nothing recorded
+        self.assertEqual(self.check(A, B, C, new_item), 0)
+        self.assertEqual(self.check(B, C, new_item), 0)
+        self.assertEqual(self.check(A, B, C, new_item), 0)
+        self.assertEqual(len(self.lines()), 1)
+        # A really goes offline -> gone line, start unknown because it was online before tracking
+        self.check(B, C, new_item); self.check(B, C, new_item)
+        gone = self.lines()[-1]
+        self.assertEqual((gone["event"], gone["id"], gone["appeared_at"], gone["online_seconds"],
+                          gone["online_since_before_tracking"]), ("gone", "1165", None, None, True))
+        self.assertEqual((gone["residence_name"], gone["label"], gone["min_rent"]), ("CITE LUMINY", "CHAMBRE CONFORT D", 350.0))
+        # A available again -> full raw item, seen before, earlier count unknown
+        self.assertEqual(self.check(A, B, C, new_item), 1)
+        back = self.lines()[-1]
+        self.assertEqual((back["event"], back["offer_seen_before"], back["offer_availability_no"]), ("appeared", True, None))
+        self.assertEqual(back["item"]["residence"]["label"], "CITE LUMINY")
+        self.assertNotIn("_tool_id", back["item"])
+        # goes again -> real duration this time; back again -> count known (lower bound)
+        self.check(B, C, new_item); self.check(B, C, new_item)
+        gone2 = self.lines()[-1]
+        self.assertEqual((gone2["online_seconds"], gone2["checks_seen"]), (0, 1))
+        self.assertNotIn("online_since_before_tracking", gone2)
+        self.check(A, B, C, new_item)
+        self.assertEqual(self.lines()[-1]["offer_availability_no"], 3)
+
+    def test_no_seeding_from_a_partial_fetch(self):
+        self.assertEqual(self.check(A, complete=False), 0)
+        self.assertEqual(self.lines(), [])
+        self.assertIsNone(self.state["tracking_started"])
+        self.assertEqual(self.state["active"], {})
+        # first complete check seeds everything known, still writes nothing
+        self.assertEqual(self.check(A, B), 0)
+        self.assertEqual(self.lines(), [])
+        self.assertEqual(sorted(self.state["active"]), ["1165", "2168"])
+
+    def test_partial_fetch_after_seeding_never_marks_gone(self):
+        self.check(A, B)
+        for _ in range(5):
+            self.check(B, complete=False)
+        self.assertEqual(self.lines(), [])
+        self.assertIn("1165", self.state["active"])
 
 
 class TestStaleStateRegression(unittest.TestCase):
