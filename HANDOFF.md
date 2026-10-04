@@ -347,20 +347,20 @@ first real trigger, whenever it happens, is the true first live test.
    older runs may have left more. Use the journal (`journalctl -u crous-watcher`) as the source
    of truth for analysis, or run other tests via a wrapper that adds the NullHandler first.
 
-11. **Pagination mixes two result orders — found 2026-10-04, NOT fixed yet (awaiting user OK).**
-   The search API returns the listing set in one of two orders, chosen per page REQUEST. When a
-   fetch's pages mix orders, some offers come back twice and others not at all: measured 2 of 6
-   test fetches (plus the bot's own fetch at 2026-10-04 00:47:54) returned 56 items but only 43
-   distinct offers. The "N in France" log counts items, not distinct offers, so it never showed.
-   Consequences: a Marseille offer online for one check has a real chance of never being alerted;
-   offers online for a long time can produce false gone/available pairs (and, for Marseille, a
-   duplicate alert) when two consecutive fetches miss them; nationwide tracking recorded 13 FALSE
-   "appeared" lines at 2026-10-04 00:52:01 (ids 1125 1184 1197 1211 1224 1268 1569 2240 2273 2441
-   2450 2477 2545 — online all along, missed by the seed fetch). Fix ready to build: the API
-   accepts `{"page": 1, "pageSize": 100}` and returned all 56 distinct offers in ONE request
-   (`size`/`perPage`/`limit` are ignored), so one request per check instead of 3 and no mixing;
-   plus treat a fetch with fewer distinct offers than `total.value` as incomplete; plus remove the
-   13 false lines and mark those offers as online-before-tracking.
+11. **FIXED 2026-10-04: pagination mixed two result orders.** The search API returns the listing
+   set in one of two orders, chosen per page REQUEST; with 20-item pages, a fetch whose pages mixed
+   orders got some offers twice and others not at all (2 of 6 test fetches, plus the bot's own fetch
+   at 2026-10-04 00:47:54, returned 56 items but only 43 distinct offers — invisible in the logs,
+   which counted items). Before the fix, a Marseille offer online for one check could be missed
+   entirely, and long-lived offers could get false gone/available pairs (duplicate Marseille alert).
+   Fix: `SEARCH_PAGE_SIZE = 100` (`{"page": 1, "pageSize": 100}`, tested live: all 56 in ONE
+   request; `size`/`perPage`/`limit` are ignored) — one request per check instead of ~3, so no
+   mixing possible below 100 listings (peak seen: 85); plus check_and_notify() treats a fetch with
+   fewer distinct offers than CROUS's `total.value` as incomplete (nothing marked gone; logs
+   "Incomplete fetch on tool …"). The 13 false nationwide "appeared" lines it caused (2026-10-04
+   00:52:01) were removed and those offers marked online-before-tracking. Tested in
+   verify_offer_availability_alerts.py (mutation-checked: without the completeness check the
+   mixed-order test fails with a duplicate alert).
 12. **3 dead scouter proxies, NOT removed yet (awaiting user OK):** 103.101.90.197:6462,
    103.99.33.246:6241, 23.27.203.233:6968. They account for ALL 15 quarantine benches since
    2026-09-28, every one `407 Proxy Authentication Required`, each re-benched ~24-28h apart (i.e.

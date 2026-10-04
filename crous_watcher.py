@@ -930,8 +930,9 @@ def update_listing_visibility(active: dict, present: dict, fetch_complete: bool,
 
     active:  {id: {"since", "last_seen", "checks", "missed", ...snapshot}} -- mutated in place
     present: {id: snapshot dict} for the matching listings seen in THIS check
-    fetch_complete: False if any part of this check's fetch failed; then absences are
-        not counted at all, since a missing listing may simply not have been fetched.
+    fetch_complete: False if any part of this check's fetch failed, or returned fewer
+        distinct offers than CROUS reported; then absences are not counted at all, since
+        a missing listing may simply not have been fetched.
 
     Returns (appeared_ids, gone) where gone is a list of (id, final active entry).
     """
@@ -1410,11 +1411,23 @@ def _settle_proxy_health(working_proxy: str | None, failed_proxies: list) -> Non
         logger.warning(f"Proxy health bookkeeping failed (ignored, polling continues): {err}")
 
 
-def fetch_all_crous_listings(tool_id: str) -> list[dict]:
+# Listings requested per search page. The API returns the result set in one of TWO
+# orders, picked per page REQUEST: with 20-per-page pagination, a fetch whose pages mixed
+# orders got some offers twice and others not at all (2026-10-04: 2 of 6 test fetches,
+# and the bot's own fetch at 00:47:54, returned 56 items but only 43 distinct offers).
+# The API accepts "pageSize" (tested: 100 -> all 56 in one request; "size"/"perPage"/
+# "limit" are ignored), and a single request can't mix orders. Peak seen so far: 85
+# listings. Above SEARCH_PAGE_SIZE it paginates again, and check_and_notify() then
+# catches any mixing via the distinct-vs-total check.
+SEARCH_PAGE_SIZE = 100
+
+
+def fetch_all_crous_listings(tool_id: str, with_total: bool = False):
     """
     Fetch all active listings for the given tool_id via the internal search REST API.
     Paginates automatically until all items are collected.
     Uses proxy rotation and automatic retry if an individual proxy fails.
+    Returns the item list, or (items, total reported by CROUS) when with_total=True.
     """
     all_items = []
     page = 1
@@ -1429,7 +1442,7 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
 
     max_proxy_retries = 3
     while True:
-        body = {"page": page}
+        body = {"page": page, "pageSize": SEARCH_PAGE_SIZE}
         req = urllib.request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
@@ -1597,7 +1610,7 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
 
         # Check if more pages exist
         is_last_page = False
-        if not items or len(items) < 20 or (total_expected and len(all_items) >= total_expected) or page >= 10:
+        if not items or len(items) < SEARCH_PAGE_SIZE or (total_expected and len(all_items) >= total_expected) or page >= 10:
             is_last_page = True
 
         next_run_str = get_next_run_estimate() if is_last_page else "2-3 seconds"
@@ -1616,7 +1629,7 @@ def fetch_all_crous_listings(tool_id: str) -> list[dict]:
         # re-testing.
         time.sleep(random.uniform(1.0, 1.5))
 
-    return all_items
+    return (all_items, total_expected) if with_total else all_items
 
 
 # Marseille city center, used for coordinate-based location matching.
@@ -1850,12 +1863,20 @@ def check_and_notify() -> tuple[int, int]:
 
     all_raw_items = []
     errors_encountered = []
+    incomplete_tools = []  # fetched without error, but fewer distinct offers than CROUS reported
 
     for idx, tid in enumerate(tool_ids):
         if idx > 0:
             time.sleep(random.uniform(2.0, 3.0))
         try:
-            items = fetch_all_crous_listings(tid)
+            items, reported_total = fetch_all_crous_listings(tid, with_total=True)
+            distinct = len({str(it.get("id")) for it in items})
+            if isinstance(reported_total, int) and distinct < reported_total:
+                logger.warning(
+                    f"Incomplete fetch on tool {tid}: {distinct} distinct offers but CROUS reports "
+                    f"{reported_total} -- absences are not counted this check"
+                )
+                incomplete_tools.append(tid)
             for it in items:
                 it["_tool_id"] = tid
             all_raw_items.extend(items)
@@ -1880,6 +1901,9 @@ def check_and_notify() -> tuple[int, int]:
     if not all_raw_items and errors_encountered and len(errors_encountered) >= len(tool_ids):
         raise RuntimeError(f"Toutes les requêtes d'outils CROUS ont échoué : {errors_encountered[0]}")
 
+    # Absences only count as "went offline" when every tool was fetched fully.
+    fetch_complete = not errors_encountered and not incomplete_tools
+
     METRICS["last_active_listings_count"] = len(all_raw_items)
     METRICS["last_check_time"] = datetime.now(timezone.utc)
     METRICS["total_checks"] += 1
@@ -1891,7 +1915,7 @@ def check_and_notify() -> tuple[int, int]:
     seen_count_before = len(nationwide_seen)
     nat_state = load_nationwide_state()
     nationwide_available = _track_nationwide_availability(
-        all_raw_items, nationwide_seen, nat_state, fetch_complete=not errors_encountered, now_iso=now_iso
+        all_raw_items, nationwide_seen, nat_state, fetch_complete=fetch_complete, now_iso=now_iso
     )
     save_nationwide_state(nat_state)
     if len(nationwide_seen) != seen_count_before:
@@ -1912,7 +1936,7 @@ def check_and_notify() -> tuple[int, int]:
                 "price": info.get("price"),
             }
     appeared, gone = update_listing_visibility(
-        active, present, fetch_complete=not errors_encountered, now_iso=now_iso
+        active, present, fetch_complete=fetch_complete, now_iso=now_iso
     )
     for gone_id, gone_entry in gone:
         history.setdefault(gone_id, {})["last_gone_at"] = gone_entry.get("last_seen")

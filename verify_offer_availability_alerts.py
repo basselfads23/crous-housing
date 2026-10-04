@@ -18,6 +18,12 @@ rooms, so an offer coming back online is new availability, usually a different r
   item on each availability, a gone line when it goes offline; offers already online
   when tracking starts are absorbed silently (no fake "just became available" lines),
   and their gone line says online_since_before_tracking; no seeding from a partial fetch
+- the search request asks for SEARCH_PAGE_SIZE (100) per page, so the whole set comes in
+  one request (two result orders mixing across 20-item pages lost offers, 2026-10-04);
+  it still paginates when a page is full
+- a fetch with fewer distinct offers than CROUS's reported total (duplicates/mixing) is
+  treated as incomplete: nothing is marked gone, so no false gone/available pair and no
+  duplicate alert
 - regression for the stale-state bug: a failed cycle no longer erases IDs recorded
   since startup (_record_cycle_failure() re-reads the file), and main_loop() no
   longer saves a startup snapshot
@@ -136,13 +142,18 @@ class TestCheckAndNotifyAvailability(unittest.TestCase):
     def _tools(self):
         return list(self.responses[0].keys()), False
 
-    def _fetch(self, tool_id):
+    def _fetch(self, tool_id, with_total=False):
         r = self.responses[0][tool_id]
         if isinstance(r, Exception):
             raise r
-        return [copy.deepcopy(x) for x in r]
+        items = [copy.deepcopy(x) for x in r]
+        total = self.reported_total if self.reported_total is not None else len({str(x["id"]) for x in items})
+        return (items, total) if with_total else items
 
-    def check(self, *items, failing_tool=False):
+    reported_total = None
+
+    def check(self, *items, failing_tool=False, reported_total=None):
+        self.reported_total = reported_total
         resp = {"47": list(items)}
         if failing_tool:
             resp["99"] = RuntimeError("simulated tool failure")
@@ -206,6 +217,17 @@ class TestCheckAndNotifyAvailability(unittest.TestCase):
             self.assertEqual(self.check(failing_tool=True), [])
         self.assertEqual(self.check(A), [], "absent only in checks where a tool failed -> still the same availability")
         self.assertEqual([l for l in self.data_lines() if l.get("event") == "gone"], [])
+
+    def test_mixed_order_fetch_never_marks_listing_gone(self):
+        # the 2026-10-04 failure mode: CROUS says 2 offers, but the fetch returned A twice and B never
+        self.check(A, B)
+        for _ in range(4):
+            self.assertEqual(self.check(A, A, reported_total=2), [])
+        out = self.check(A, B)
+        self.assertEqual(out, [], "B was online all along -- no second alert")
+        self.assertEqual([l for l in self.data_lines() if l.get("event") == "gone"], [])
+        nat = [json.loads(l) for l in (self.tmp / "nationwide.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([l["event"] for l in nat], ["appeared", "appeared"], "no false nationwide gone/appeared pair")
 
     def test_legacy_seen_id_alerts_like_any_other(self):
         # B was alerted before this feature existed: in seen_ids, no history
@@ -313,6 +335,52 @@ class TestNationwideAvailability(unittest.TestCase):
             self.check(B, complete=False)
         self.assertEqual(self.lines(), [])
         self.assertIn("1165", self.state["active"])
+
+
+class FakeResp:
+    def __init__(self, payload):
+        self._b = json.dumps(payload).encode("utf-8")
+    def read(self):
+        return self._b
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+
+class TestSearchPageSize(unittest.TestCase):
+    def run_fetch(self, total):
+        bodies = []
+        ids = list(range(1, total + 1))
+        class Opener:
+            def open(_, req, timeout=None):
+                body = json.loads(req.data.decode("utf-8"))
+                bodies.append(body)
+                size, page = body.get("pageSize", 20), body["page"]
+                chunk = ids[(page - 1) * size: page * size]
+                return FakeResp({"results": {"items": [{"id": i} for i in chunk], "total": {"value": total}}})
+        with mock.patch.object(cw, "get_crous_opener_and_proxy", return_value=(Opener(), "http://u:p@1.1.1.1:1")), \
+             mock.patch.object(cw, "_settle_proxy_health"), mock.patch.object(cw, "activity_logger", None), \
+             mock.patch.object(cw.time, "sleep"):
+            items, reported = cw.fetch_all_crous_listings("47", with_total=True)
+        return bodies, items, reported
+
+    def test_whole_set_in_one_request(self):
+        bodies, items, reported = self.run_fetch(56)
+        self.assertEqual(bodies, [{"page": 1, "pageSize": cw.SEARCH_PAGE_SIZE}])
+        self.assertEqual((len(items), reported), (56, 56))
+
+    def test_still_paginates_above_page_size(self):
+        bodies, items, reported = self.run_fetch(150)
+        self.assertEqual([b["page"] for b in bodies], [1, 2])
+        self.assertEqual((len(items), len({i["id"] for i in items}), reported), (150, 150, 150))
+
+    def test_default_call_still_returns_a_list(self):
+        with mock.patch.object(cw, "get_crous_opener_and_proxy",
+                               return_value=(type("O", (), {"open": lambda s, r, timeout=None: FakeResp(
+                                   {"results": {"items": [{"id": 1}], "total": {"value": 1}}})})(), "http://u:p@1.1.1.1:1")), \
+             mock.patch.object(cw, "_settle_proxy_health"), mock.patch.object(cw, "activity_logger", None):
+            self.assertEqual(cw.fetch_all_crous_listings("47"), [{"id": 1}])
 
 
 class TestStaleStateRegression(unittest.TestCase):
