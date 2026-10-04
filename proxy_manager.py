@@ -29,11 +29,12 @@ QUARANTINE_FILE = BASE_DIR / ".proxy_quarantine.json"
 PROXY_STRIKE_LIMIT = 3               # consecutive proxy-specific failures before a proxy is benched
 QUARANTINE_MAX_FRACTION = 0.25       # never bench more than this share of the pool
 # Bench length grows each time the same proxy is benched again without a success in between:
-# 1, 2, 4, then 7 days (cap). After each bench the proxy gets ONE more chance (probation).
-# Why growing (2026-10-04): CROUS-side blocks last days -- 9 proxies still blocked 9 days on --
-# and every retry of a blocked proxy is a ~12 s timeout on that check, while Marseille rooms are
-# gone in 20-30 s. A fixed 24 h bench retried them daily forever. Any success resets everything.
-BENCH_DURATIONS_SECONDS = (1 * 86400, 2 * 86400, 4 * 86400, 7 * 86400)
+# 2, 3, 5, then 10 days (cap) -- the user's call 2026-10-04, since CROUS blocks last long.
+# After each bench the proxy gets ONE more chance (probation). Why growing: CROUS-side blocks
+# last days -- 9 proxies still blocked 9 days on -- and every retry of a blocked proxy is a
+# ~12 s timeout on that check, while Marseille rooms are gone in 20-30 s. The old fixed 24 h
+# bench retried them daily forever. Any success resets everything.
+BENCH_DURATIONS_SECONDS = (2 * 86400, 3 * 86400, 5 * 86400, 10 * 86400)
 QUARANTINE_TTL_SECONDS = BENCH_DURATIONS_SECONDS[0]   # first bench (kept for existing callers/tests)
 
 
@@ -312,7 +313,7 @@ def _write_quarantine_state(state: dict) -> None:
 def get_quarantined_proxies() -> dict[str, dict]:
     """
     Currently benched proxies, {host:port: info}. A bench lasts
-    bench_duration_seconds(info["bench_count"]) (1, 2, 4, 7 days). When it ends the proxy
+    bench_duration_seconds(info["bench_count"]) (2, 3, 5, 10 days). When it ends the proxy
     goes on probation (strikes = limit - 1): ONE further proxy-specific failure re-benches
     it immediately, for longer; one success clears it fully. Manual recovery: delete
     .proxy_quarantine.json.
@@ -414,7 +415,7 @@ def record_proxy_strike(proxy_url: str | None, reason: str = "") -> dict:
 def bench_proxy(key: str, reason: str, bench_count: int = 1) -> None:
     """
     Bench a proxy by hand (host:port), as if it had just been benched for the
-    bench_count-th time in a row: e.g. bench_count=4 -> 7 days, then probation. Used to
+    bench_count-th time in a row: e.g. bench_count=4 -> 10 days, then probation. Used to
     keep proxies known to be blocked by CROUS out of rotation when the Webshare sync puts
     them back in the list (Webshare only checks that a proxy works, not that CROUS lets it in).
     """

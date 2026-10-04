@@ -3,7 +3,7 @@ verify_webshare_sync.py — run with: venv/bin/python3 verify_webshare_sync.py
 
 Covers the 2026-10-04 proxy-pool changes:
 - escalating benches: the same proxy benched again without a success in between stays out
-  1, 2, 4, then 7 days (cap); any success resets it to 1 day; bench_proxy() benches by hand
+  2, 3, 5, then 10 days (cap); any success resets it to 2 days; bench_proxy() benches by hand
 - load_proxies() = proxies.txt (hand-managed, Oxylabs) + proxies_webshare.txt (synced)
 - sync_webshare_proxies(): writes only valid proxies; off unless WEBSHARE_SYNC_ENABLED;
   due every 12 h, never more than once an hour; a 407 requests an early sync; on ANY
@@ -90,8 +90,8 @@ class TestEscalatingBench(Base):
 
     def test_durations_escalate_and_cap(self):
         r = self.strike(1, 3)
-        self.assertEqual((r["bench_count"], r["bench_seconds"]), (1, DAY))
-        expected = [2 * DAY, 4 * DAY, 7 * DAY, 7 * DAY]
+        self.assertEqual((r["bench_count"], r["bench_seconds"]), (1, 2 * DAY))
+        expected = [3 * DAY, 5 * DAY, 10 * DAY, 10 * DAY]
         for n, dur in enumerate(expected, start=2):
             prev = pm.bench_duration_seconds(n - 1)
             self.t += prev - 60
@@ -102,36 +102,36 @@ class TestEscalatingBench(Base):
             self.assertTrue(r["quarantined_now"])
             self.assertEqual((r["bench_count"], r["bench_seconds"]), (n, dur))
 
-    def test_success_resets_to_one_day(self):
+    def test_success_resets_to_first_bench(self):
         self.strike(1, 3)
-        self.t += DAY + 1
-        pm.get_quarantined_proxies()
-        self.strike(1)                       # bench #2 (2 days)
         self.t += 2 * DAY + 1
+        pm.get_quarantined_proxies()
+        self.strike(1)                       # bench #2 (3 days)
+        self.t += 3 * DAY + 1
         pm.get_quarantined_proxies()
         pm.record_proxy_success(url(1))      # it works again
         self.assertNotIn(key(1), json.loads(pm.QUARANTINE_FILE.read_text()))
         r = self.strike(1, 3)
-        self.assertEqual((r["bench_count"], r["bench_seconds"]), (1, DAY), "a success wipes the history")
+        self.assertEqual((r["bench_count"], r["bench_seconds"]), (1, 2 * DAY), "a success wipes the history")
 
     def test_entries_written_before_escalation_count_as_first_bench(self):
         pm._write_quarantine_state({key(1): {"strikes": 3, "quarantined_at": self.t, "last_reason": "407"}})
-        self.t += DAY - 60
+        self.t += 2 * DAY - 60
         self.assertIn(key(1), pm.get_quarantined_proxies())
         self.t += 120
         self.assertNotIn(key(1), pm.get_quarantined_proxies())
 
-    def test_manual_bench_seven_days_then_probation(self):
+    def test_manual_bench_ten_days_then_probation(self):
         pm.bench_proxy(key(2), "CROUS-side block", bench_count=4)
         self.assertIn(key(2), pm.get_quarantined_proxies())
         rotation = {pm.proxy_key(pm.get_current_proxy(rotate=True)) for _ in range(60)}
         self.assertNotIn(key(2), rotation, "a benched proxy is never handed out")
-        self.t += 7 * DAY - 60
+        self.t += 10 * DAY - 60
         self.assertIn(key(2), pm.get_quarantined_proxies())
         self.t += 120
         self.assertNotIn(key(2), pm.get_quarantined_proxies())
         r = self.strike(2)
-        self.assertEqual((r["quarantined_now"], r["bench_seconds"]), (True, 7 * DAY))
+        self.assertEqual((r["quarantined_now"], r["bench_seconds"]), (True, 10 * DAY))
 
     def test_quarantine_state_has_no_credentials(self):
         self.strike(1, 3)
@@ -273,13 +273,14 @@ class TestWatcherWiring(Base):
         for _ in range(3):
             self.fail_then_succeed(1)
         self.assertEqual(len(self.sent), 1)
-        self.assertIn("pendant 24h", self.sent[0])
-        self.t += DAY + 1
+        self.assertIn("pendant 2 jours", self.sent[0])
+        self.assertIn("3, 5 puis 10 jours", self.sent[0])
+        self.t += 2 * DAY + 1
         pm.get_quarantined_proxies()
         with self.assertLogs("crous_watcher", level="WARNING") as logs:
-            self.fail_then_succeed(1)  # probation failure -> bench #2, 2 days
+            self.fail_then_succeed(1)  # probation failure -> bench #2, 3 days
         self.assertEqual(len(self.sent), 1, "re-bench is logged, not sent")
-        self.assertTrue(any("2 jours" in l and "bench #2" in l for l in logs.output), logs.output)
+        self.assertTrue(any("3 jours" in l and "bench #2" in l for l in logs.output), logs.output)
 
     def test_407_requests_a_sync(self):
         self.fail_then_succeed(5, "<urlopen error Tunnel connection failed: 407 Proxy Authentication Required>")

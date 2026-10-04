@@ -40,8 +40,13 @@ class TestToolIdFetchFlag(unittest.TestCase):
     def setUp(self):
         crous_watcher._TOOL_IDS_CACHE["ids"] = None
         crous_watcher._TOOL_IDS_CACHE["checked_at"] = 0.0
+        # activity_logger appends every attempt to the LIVE scouter.log -- keep fake
+        # "proxyA" rows out of it (they leaked there on every run until 2026-10-04).
+        self._al = mock.patch.object(crous_watcher, "activity_logger", mock.Mock())
+        self._al.start()
 
     def tearDown(self):
+        self._al.stop()
         crous_watcher._TOOL_IDS_CACHE["ids"] = None
         crous_watcher._TOOL_IDS_CACHE["checked_at"] = 0.0
 

@@ -355,6 +355,10 @@ first real trigger, whenever it happens, is the true first live test.
    triggers — into the production log. 60 such lines from 2026-10-02 test runs were removed;
    older runs may have left more. Use the journal (`journalctl -u crous-watcher`) as the source
    of truth for analysis, or run other tests via a wrapper that adds the NullHandler first.
+   Separately, activity_logger writes every scouter attempt straight to the LIVE scouter.log
+   (not via logging, so the NullHandler doesn't help): verify_tool_id_fetch_flag.py didn't mock it
+   and left fake "proxyA" rows on every run — fixed 2026-10-04 (it now mocks activity_logger) and
+   the 20 fake rows were removed.
 
 11. **FIXED 2026-10-04: pagination mixed two result orders.** The search API returns the listing
    set in one of two orders, chosen per page REQUEST; with 20-item pages, a fetch whose pages mixed
@@ -370,24 +374,29 @@ first real trigger, whenever it happens, is the true first live test.
    00:52:01) were removed and those offers marked online-before-tracking. Tested in
    verify_offer_availability_alerts.py (mutation-checked: without the completeness check the
    mixed-order test fails with a duplicate alert).
-13. **Webshare sync + escalating quarantine — BUILT 2026-10-04, NOT YET DEPLOYED (awaiting user OK).**
-   Code is committed but inert until `.env` has `WEBSHARE_SYNC_ENABLED=true` and
-   `WEBSHARE_DATACENTER_PLAN_ID=14397141`. Design: proxy_manager.sync_webshare_proxies() writes the
+13. **DEPLOYED 2026-10-04 ~01:40 UTC: Webshare sync + escalating quarantine.** `.env` has
+   `WEBSHARE_SYNC_ENABLED=true` and `WEBSHARE_DATACENTER_PLAN_ID=14397141` (backup of the previous
+   .env: ~/crous-env.bak-2026-10-04, mode 600). proxy_manager.sync_webshare_proxies() writes the
    plan's VALID proxies to proxies_webshare.txt (gitignored, generated — never edit) every 12 h, and
    within the hour after any 407; never more than 1 API call/hour; on ANY failure (API error, empty
-   list, list < half the current one) the current file is kept, and the 3rd failure in a row alerts
-   on Telegram. load_proxies() = proxies.txt (hand-managed: Oxylabs) + proxies_webshare.txt (the
-   synced file sits next to PROXIES_FILE, so tests that redirect PROXIES_FILE stay isolated).
-   Quarantine entries of proxies that leave the plan are dropped at sync; benches of proxies still
-   listed are kept. Benches escalate per proxy: 1, 2, 4, 7 days (cap) for consecutive benches
-   without a success in between (`bench_count`); any success clears it; probation unchanged (one
-   failure after a bench re-benches). proxy_manager.bench_proxy(key, reason, bench_count) benches
+   list, list < half the current one) the current file is kept and retried hourly, and the 3rd
+   failure in a row alerts on Telegram; a changed list is reported on Telegram. proxies.txt now
+   holds ONLY hand-managed entries (5 Oxylabs + the disabled second account); its Webshare section
+   was removed (backup proxies.txt.bak-2026-10-04-presync). load_proxies() = proxies.txt +
+   proxies_webshare.txt (the synced file sits next to PROXIES_FILE, so tests that redirect
+   PROXIES_FILE stay isolated). Quarantine entries of proxies that leave the plan are dropped at
+   sync; benches of proxies still listed are kept. **Bench lengths (user's call): 2, 3, 5, then 10
+   days (cap)** for consecutive benches of the same proxy without a success in between
+   (`bench_count`); any success clears it; probation unchanged (one failure after a bench
+   re-benches, for the next length). proxy_manager.bench_proxy(key, reason, bench_count) benches
    by hand. Telegram only on a proxy's FIRST bench; re-benches are logged. /status shows the last
-   sync and the benched count. Deploy plan: stop watcher → real first sync → bench the 9
-   CROUS-blocked proxies at bench_count=4 (7 days) so the sync can't put them back in rotation →
-   strip the Webshare section from proxies.txt (backup) → set the 2 .env lines → start → verify.
-   Tested: verify_webshare_sync.py (21 tests, incl. a replay of the 2026-09-28 replacement) +
-   a live sync against the real API into a temp dir (200 proxies, replacements in, dead ones out).
+   sync and the benched count. At deploy: the 9 CROUS-blocked proxies (104.252.92.204,
+   108.165.197.176, 108.165.53.90, 45.39.25.234, 50.114.84.101, 85.198.47.65, 92.112.170.144,
+   92.112.170.98, 92.112.171.18) were benched by hand at bench_count=4 (10 days, until ~2026-10-14)
+   because Webshare lists them as valid; then one try each, re-benched 10 days if still blocked.
+   Result: 205 proxies (200 Webshare + 5 Oxylabs), 196 in rotation. First automatic sync due
+   2026-10-04 ~13:40 UTC. Tested: verify_webshare_sync.py (21 tests, incl. a replay of the
+   2026-09-28 replacement), all 18 verify_*.py files, and a live sync against the real API.
 12. **RESOLVED 2026-10-04: 3 dead scouter proxies** (103.101.90.197:6462, 103.99.33.246:6241,
    23.27.203.233:6968) caused ALL 15 quarantine benches since 2026-09-28, every one `407 Proxy
    Authentication Required`, re-benched ~24-28h apart (failed on first use after every release).

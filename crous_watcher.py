@@ -1384,6 +1384,12 @@ def discover_tool_ids_with_fetch_flag() -> tuple[list[str], bool]:
     return tool_ids, did_real_fetch
 
 
+def _later_bench_durations_text() -> str:
+    """'3, 5 puis 10 jours' -- the bench lengths after the first, from proxy_manager's config."""
+    days = [str(round(d / 86400)) for d in proxy_manager.BENCH_DURATIONS_SECONDS[1:]]
+    return (", ".join(days[:-1]) + " puis " + days[-1] if len(days) > 1 else days[0]) + " jours"
+
+
 def _settle_proxy_health(working_proxy: str | None, failed_proxies: list) -> None:
     """
     Per-proxy health bookkeeping for the scouter's datacenter pool (see
@@ -1425,7 +1431,7 @@ def _settle_proxy_health(working_proxy: str | None, failed_proxies: list) -> Non
                         f"• *Raison :* `{limit} échecs consécutifs (dernier : {safe_reason})`\n"
                         f"• *Proxys non écartés :* {result['pool_size'] - result['benched_count']}/{result['pool_size']}\n"
                         f"• *Action :* Exclu du scouter pendant {duration}, puis un dernier essai "
-                        "(s'il échoue encore : 2, 4 puis 7 jours)."
+                        f"(s'il échoue encore : {_later_bench_durations_text()})."
                     )
             elif result["blocked_by_floor"]:
                 logger.warning(f"Proxy {failed_key} reached the strike limit but was NOT benched: quarantine cap reached")

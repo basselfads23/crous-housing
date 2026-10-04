@@ -141,7 +141,7 @@ class TestQuarantineUnit(QuarantineBase):
                 proxy_manager.record_proxy_strike(bad, "x")
             self.assertIn(key_of(1), proxy_manager.get_quarantined_proxies())
         with mock.patch.object(proxy_manager.time, "time", return_value=t0 + proxy_manager.QUARANTINE_TTL_SECONDS - 1):
-            self.assertIn(key_of(1), proxy_manager.get_quarantined_proxies(), "still benched just before 24h")
+            self.assertIn(key_of(1), proxy_manager.get_quarantined_proxies(), "still benched just before the first bench ends")
         with mock.patch.object(proxy_manager.time, "time", return_value=t0 + proxy_manager.QUARANTINE_TTL_SECONDS + 1):
             self.assertNotIn(key_of(1), proxy_manager.get_quarantined_proxies())
             self.assertEqual(self.state()[key_of(1)]["strikes"], proxy_manager.PROXY_STRIKE_LIMIT - 1)
